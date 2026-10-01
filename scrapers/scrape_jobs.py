@@ -1,0 +1,587 @@
+#!/usr/bin/env python3
+"""
+RemoteReady HQ job scraper (Playwright).
+
+Priority: Support, Sales, Marketing, Operations (+ Remotive/RemoteOK/Jobicy).
+Stamps rrhq_category into description for accurate frontend pill counts.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterable
+from urllib.parse import urlparse
+
+from dotenv import load_dotenv
+from playwright.sync_api import sync_playwright
+
+ROOT = Path(__file__).resolve().parent
+load_dotenv(ROOT / ".env")
+load_dotenv(ROOT.parent / ".env.local")
+
+SUPABASE_URL = (
+    os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL") or ""
+).rstrip("/")
+SUPABASE_KEY = (
+    os.getenv("SUPABASE_SECRET_KEY")
+    or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    or os.getenv("NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY")
+    or ""
+)
+
+TARGET_MIN = int(os.getenv("SCRAPER_TARGET_MIN", "120"))
+SUPPORT_MIN = int(os.getenv("SCRAPER_SUPPORT_MIN", "30"))
+SALES_MIN = int(os.getenv("SCRAPER_SALES_MIN", "30"))
+
+REMOTIVE_PRIORITY = [
+    ("customer-support", "Support"),
+    ("sales", "Sales"),
+    ("marketing", "Marketing"),
+    ("devops", "Engineering"),
+    ("software-dev", "Engineering"),
+    ("product", "Product"),
+    ("design", "Design"),
+    ("human-resources", "Operations"),
+    ("finance-legal", "Operations"),
+]
+
+JOBICY_PRIORITY = [
+    ("support", "Support"),
+    ("sales", "Sales"),
+    ("marketing", "Marketing"),
+    ("operations", "Operations"),
+    ("helpdesk", "Support"),
+    ("business-development", "Sales"),
+]
+
+REMOTEOK_PATHS = [
+    ("remote-customer-support-jobs.json", "Support"),
+    ("remote-sales-jobs.json", "Sales"),
+]
+
+SALES_TITLE = re.compile(
+    r"\b(sales|account executive|account manager|sdr|bdr|business development|"
+    r"revenue|closer|quota|go[- ]to[- ]market|gtm)\b",
+    re.I,
+)
+SUPPORT_TITLE = re.compile(
+    r"\b(support|customer success|customer service|help ?desk|service desk|"
+    r"technical support|cx |client success|care specialist|onsite support)\b",
+    re.I,
+)
+MARKETING_TITLE = re.compile(
+    r"\b(marketing|copywriter|content|seo|growth|social media|brand manager)\b",
+    re.I,
+)
+OPS_TITLE = re.compile(
+    r"\b(operations|ops|coordinator|specialist|assistant|recruiter|people|hr)\b",
+    re.I,
+)
+
+
+@dataclass(frozen=True)
+class JobListing:
+    title: str
+    company: str
+    location: str
+    salary_range: str | None
+    description: str
+    apply_url: str
+    category: str  # Support | Sales | Marketing | Operations | Engineering | Design | Product
+
+    def fingerprint(self) -> str:
+        raw = (
+            f"{self.title.strip().lower()}|"
+            f"{self.company.strip().lower()}|"
+            f"{self.apply_url.strip().lower()}"
+        )
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def normalize_whitespace(text: str | None) -> str:
+    if not text:
+        return ""
+    no_tags = re.sub(r"<[^>]+>", " ", str(text))
+    return re.sub(r"\s+", " ", no_tags).strip()
+
+
+def strip_description_boilerplate(text: str) -> str:
+    """Drop GDPR / board spam / recruiter disclaimers from the tail."""
+    cutters = [
+        r"(?i)Why Apply Through Jobgether\??",
+        r"(?i)How Jobgether works\s*:",
+        r"(?i)Data Privacy Notice\s*:",
+        r"(?i)By submitting your application, you acknowledge that Jobgether",
+        r"(?i)This processing is based on legitimate interest",
+        r"(?i)Find more .+ Jobs (?:in .+ )?on Arbeitnow",
+        r"#LI-[A-Z0-9-]+\b",
+        r"(?i)Please note that we will never request payment or bank account information",
+    ]
+    out = text
+    for pattern in cutters:
+        m = re.search(pattern, out)
+        if m:
+            out = out[: m.start()].rstrip(" .,\n\t")
+    out = re.sub(
+        r"(?i)\s*You may exercise your rights[\s\S]*$",
+        "",
+        out,
+    )
+    return out.strip()
+
+
+def normalize_description(text: str | None) -> str:
+    """Preserve paragraph / list structure instead of collapsing to one line."""
+    if not text:
+        return ""
+    raw = str(text)
+    raw = re.sub(r"(?i)<br\s*/?>", "\n", raw)
+    raw = re.sub(r"(?i)</(p|div|h[1-6]|tr)>", "\n\n", raw)
+    raw = re.sub(r"(?i)</li>", "\n", raw)
+    raw = re.sub(r"(?i)<li[^>]*>", "• ", raw)
+    raw = re.sub(r"(?i)<h[1-6][^>]*>", "\n\n", raw)
+    raw = re.sub(r"(?i)</h[1-6]>", "\n", raw)
+    raw = re.sub(r"<[^>]+>", " ", raw)
+    raw = (
+        raw.replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&quot;", '"')
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+    )
+    raw = strip_description_boilerplate(raw)
+    raw = re.sub(r"[ \t]+", " ", raw)
+    raw = re.sub(r" *\n *", "\n", raw)
+    raw = re.sub(r"\n{3,}", "\n\n", raw)
+    return raw.strip()
+
+
+def repair_char_joined_location(text: str) -> str:
+    """Undo ', '.join(string) artifacts like 'S, w, i, t, z, e, r, l, a, n, d'."""
+    parts = text.split(", ")
+    if len(parts) < 4:
+        return text
+    single_ratio = sum(1 for p in parts if len(p) <= 1) / len(parts)
+    if single_ratio < 0.8:
+        return text
+    return "".join(parts)
+
+
+def normalize_location(location: object | None) -> str:
+    if location is None:
+        return "Worldwide / Remote"
+    if isinstance(location, (list, tuple)):
+        parts = [normalize_whitespace(str(x)) for x in location if x]
+        text = ", ".join(parts)
+    else:
+        text = normalize_whitespace(str(location))
+    text = repair_char_joined_location(text)
+    text = re.sub(r"\s+,", ",", text)
+    text = re.sub(r",\s*", ", ", text)
+    text = re.sub(r"^(?:,\s*)+|(?:,\s*)+$", "", text).strip()
+    return text or "Worldwide / Remote"
+
+
+def infer_category(title: str, fallback: str) -> str:
+    if SUPPORT_TITLE.search(title):
+        return "Support"
+    if SALES_TITLE.search(title):
+        return "Sales"
+    if MARKETING_TITLE.search(title):
+        return "Marketing"
+    if OPS_TITLE.search(title):
+        return "Operations"
+    return fallback
+
+
+def stamp_description(description: str, category: str) -> str:
+    body = normalize_description(description)[:4_800]
+    return f"rrhq_category:{category}\n{body}"
+
+
+def require_supabase() -> tuple[str, str]:
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        print("Missing Supabase env vars", file=sys.stderr)
+        sys.exit(1)
+    return SUPABASE_URL, SUPABASE_KEY
+
+
+def supabase_request(
+    method: str,
+    path: str,
+    *,
+    body: object | None = None,
+    prefer: str | None = None,
+) -> tuple[int, object]:
+    url, key = require_supabase()
+    headers = {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    if prefer:
+        headers["Prefer"] = prefer
+    data = None if body is None else json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        f"{url}{path}", data=data, headers=headers, method=method
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            raw = resp.read().decode("utf-8")
+            return resp.status, json.loads(raw) if raw else None
+    except urllib.error.HTTPError as err:
+        raw = err.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"Supabase {method} {path} → {err.code}: {raw[:400]}"
+        ) from err
+
+
+def make_listing(
+    *,
+    title: str,
+    company: str,
+    location: str,
+    salary: str | None,
+    description: str,
+    apply_url: str,
+    category: str,
+) -> JobListing | None:
+    title = normalize_whitespace(title)
+    company = normalize_whitespace(company) or "Unknown"
+    apply_url = (apply_url or "").strip()
+    if not title or not apply_url:
+        return None
+    if apply_url.startswith("/"):
+        return None
+    cat = infer_category(title, category)
+    return JobListing(
+        title=title[:200],
+        company=company[:120],
+        location=normalize_location(location)[:120],
+        salary_range=(salary[:80] if salary else None),
+        description=stamp_description(description, cat),
+        apply_url=apply_url[:1_000],
+        category=cat,
+    )
+
+
+def parse_remotive(jobs_raw: list, fallback_cat: str) -> list[JobListing]:
+    out: list[JobListing] = []
+    for item in jobs_raw:
+        salary = normalize_whitespace(item.get("salary")) or None
+        listing = make_listing(
+            title=item.get("title") or "",
+            company=item.get("company_name") or "",
+            location=normalize_location(
+                item.get("candidate_required_location") or "Worldwide / Remote"
+            ),
+            salary=salary,
+            description=item.get("description") or "",
+            apply_url=item.get("url") or item.get("apply_url") or "",
+            category=fallback_cat,
+        )
+        if listing:
+            out.append(listing)
+    return out
+
+
+def parse_remoteok(rows: list, fallback_cat: str) -> list[JobListing]:
+    out: list[JobListing] = []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        title = item.get("position") or item.get("title") or ""
+        apply_url = (
+            item.get("apply_url")
+            or item.get("url")
+            or (f"https://remoteok.com/remote-jobs/{item['id']}" if item.get("id") else "")
+        )
+        salary = None
+        if item.get("salary_min") or item.get("salary_max"):
+            lo = item.get("salary_min") or ""
+            hi = item.get("salary_max") or ""
+            salary = normalize_whitespace(f"${lo} - ${hi}".strip(" -"))
+            if salary in ("$", ""):
+                salary = None
+        # Prefer tag-based category when present
+        tags = " ".join(item.get("tags") or [])
+        cat = fallback_cat
+        if SUPPORT_TITLE.search(tags) or SUPPORT_TITLE.search(title):
+            cat = "Support"
+        elif SALES_TITLE.search(tags) or SALES_TITLE.search(title):
+            cat = "Sales"
+        listing = make_listing(
+            title=title,
+            company=item.get("company") or "",
+            location=normalize_location(item.get("location") or "Worldwide / Remote"),
+            salary=salary,
+            description=item.get("description") or "",
+            apply_url=str(apply_url),
+            category=cat,
+        )
+        if listing:
+            out.append(listing)
+    return out
+
+
+def parse_jobicy(jobs_raw: list, fallback_cat: str) -> list[JobListing]:
+    out: list[JobListing] = []
+    for item in jobs_raw:
+        listing = make_listing(
+            title=item.get("jobTitle") or item.get("title") or "",
+            company=item.get("companyName") or item.get("company") or "",
+            location=normalize_location(item.get("jobGeo") or "Worldwide / Remote"),
+            salary=None,
+            description=item.get("jobDescription") or item.get("jobExcerpt") or "",
+            apply_url=item.get("url") or item.get("jobUrl") or "",
+            category=fallback_cat,
+        )
+        if listing:
+            out.append(listing)
+    return out
+
+
+def parse_arbeitnow(rows: list) -> list[JobListing]:
+    out: list[JobListing] = []
+    for item in rows:
+        title = item.get("title") or ""
+        # Only keep Support / Sales / Marketing / Ops to boost those pillars
+        if SUPPORT_TITLE.search(title):
+            cat = "Support"
+        elif SALES_TITLE.search(title):
+            cat = "Sales"
+        elif MARKETING_TITLE.search(title):
+            cat = "Marketing"
+        elif OPS_TITLE.search(title):
+            cat = "Operations"
+        else:
+            continue
+        listing = make_listing(
+            title=title,
+            company=(item.get("company_name") or item.get("company") or "Unknown"),
+            location=normalize_location(item.get("location")),
+            salary=None,
+            description=item.get("description") or "",
+            apply_url=item.get("url") or "",
+            category=cat,
+        )
+        if listing:
+            out.append(listing)
+    return out
+
+
+def scrape_all() -> list[JobListing]:
+    all_jobs: list[JobListing] = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            ),
+            locale="en-US",
+        )
+        try:
+            # 1) Jobicy — high volume Support/Sales/Marketing/Ops
+            for tag, cat in JOBICY_PRIORITY:
+                url = f"https://jobicy.com/api/v2/remote-jobs?count=100&tag={tag}"
+                print(f"Fetching {url}")
+                res = context.request.get(url, timeout=60_000)
+                if not res.ok:
+                    print(f"  ! HTTP {res.status}", file=sys.stderr)
+                    continue
+                jobs = (res.json() or {}).get("jobs") or []
+                parsed = parse_jobicy(jobs, cat)
+                print(f"  → {len(parsed)} jobicy/{tag} ({cat})")
+                all_jobs.extend(parsed)
+
+            # 2) Remotive priority categories
+            for slug, cat in REMOTIVE_PRIORITY:
+                url = f"https://remotive.com/api/remote-jobs?category={slug}"
+                print(f"Fetching {url}")
+                res = context.request.get(url, timeout=60_000)
+                if not res.ok:
+                    continue
+                jobs = (res.json() or {}).get("jobs") or []
+                parsed = parse_remotive(jobs, cat)
+                print(f"  → {len(parsed)} remotive/{slug}")
+                all_jobs.extend(parsed)
+
+            # 3) RemoteOK sales/support feeds
+            for path, cat in REMOTEOK_PATHS:
+                url = f"https://remoteok.com/{path}"
+                print(f"Fetching {url}")
+                res = context.request.get(url, timeout=60_000)
+                if not res.ok:
+                    continue
+                rows = res.json()
+                if isinstance(rows, list):
+                    parsed = parse_remoteok(rows, cat)
+                    print(f"  → {len(parsed)} remoteok/{path}")
+                    all_jobs.extend(parsed)
+
+            # 4) RemoteOK general
+            print("Fetching https://remoteok.com/api")
+            res = context.request.get("https://remoteok.com/api", timeout=60_000)
+            if res.ok:
+                rows = res.json()
+                if isinstance(rows, list):
+                    parsed = parse_remoteok(rows, "Engineering")
+                    print(f"  → {len(parsed)} remoteok/api")
+                    all_jobs.extend(parsed)
+
+            # 5) Arbeitnow — filter to Support/Sales/Marketing/Ops
+            print("Fetching https://www.arbeitnow.com/api/job-board-api")
+            res = context.request.get(
+                "https://www.arbeitnow.com/api/job-board-api", timeout=60_000
+            )
+            if res.ok:
+                data = (res.json() or {}).get("data") or []
+                parsed = parse_arbeitnow(data)
+                print(f"  → {len(parsed)} arbeitnow (filtered)")
+                all_jobs.extend(parsed)
+        finally:
+            context.close()
+            browser.close()
+    return all_jobs
+
+
+def deduplicate(jobs: Iterable[JobListing]) -> list[JobListing]:
+    by_fp: dict[str, JobListing] = {}
+    by_url: set[str] = set()
+    for job in jobs:
+        fp = job.fingerprint()
+        url_key = job.apply_url.strip().lower()
+        try:
+            parsed = urlparse(job.apply_url)
+            host_path = f"{parsed.netloc}{parsed.path}".lower().rstrip("/")
+        except Exception:
+            host_path = url_key
+        if fp in by_fp or url_key in by_url or host_path in by_url:
+            continue
+        by_fp[fp] = job
+        by_url.add(url_key)
+        by_url.add(host_path)
+    return list(by_fp.values())
+
+
+def fetch_existing_keys() -> set[str]:
+    existing: set[str] = set()
+    page_size = 1_000
+    start = 0
+    while True:
+        _, rows = supabase_request(
+            "GET",
+            f"/rest/v1/jobs?select=apply_url&offset={start}&limit={page_size}",
+        )
+        if not isinstance(rows, list):
+            break
+        for row in rows:
+            url = (row.get("apply_url") or "").strip().lower()
+            if url:
+                existing.add(url)
+        if len(rows) < page_size:
+            break
+        start += page_size
+    return existing
+
+
+def count_jobs() -> int:
+    url, key = require_supabase()
+    req = urllib.request.Request(
+        f"{url}/rest/v1/jobs?select=id",
+        headers={
+            "apikey": key,
+            "Authorization": f"Bearer {key}",
+            "Prefer": "count=exact",
+            "Range": "0-0",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            cr = resp.headers.get("content-range") or ""
+            if "/" in cr and cr.split("/")[-1].isdigit():
+                return int(cr.split("/")[-1])
+    except Exception:
+        pass
+    _, rows = supabase_request("GET", "/rest/v1/jobs?select=id")
+    return len(rows) if isinstance(rows, list) else 0
+
+
+def to_row(job: JobListing) -> dict:
+    return {
+        "title": job.title,
+        "company": job.company,
+        "location": job.location,
+        "salary": job.salary_range,
+        "description": job.description,
+        "apply_url": job.apply_url,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def insert_jobs(jobs: list[JobListing]) -> tuple[int, int]:
+    existing = fetch_existing_keys()
+    fresh = [j for j in jobs if j.apply_url.strip().lower() not in existing]
+    skipped = len(jobs) - len(fresh)
+    if not fresh:
+        return 0, skipped
+    rows = [to_row(j) for j in fresh]
+    inserted = 0
+    batch_size = 40
+    for i in range(0, len(rows), batch_size):
+        batch = rows[i : i + batch_size]
+        supabase_request(
+            "POST", "/rest/v1/jobs", body=batch, prefer="return=minimal"
+        )
+        inserted += len(batch)
+        print(f"  inserted batch {i // batch_size + 1}: +{len(batch)}")
+    return inserted, skipped
+
+
+def category_breakdown(jobs: list[JobListing]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for j in jobs:
+        counts[j.category] = counts.get(j.category, 0) + 1
+    return counts
+
+
+def main() -> int:
+    print(f"RemoteReady HQ scraper — {datetime.now(timezone.utc).isoformat()}")
+    require_supabase()
+    scraped = scrape_all()
+    unique = deduplicate(scraped)
+    print(f"Scraped {len(scraped)} → {len(unique)} after dedupe.")
+    print("Category mix (scraped unique):", category_breakdown(unique))
+
+    if not unique:
+        return 1
+
+    # Prefer inserting Support/Sales first to hit pillar targets
+    priority = sorted(
+        unique,
+        key=lambda j: (0 if j.category in ("Support", "Sales") else 1, j.title),
+    )
+    inserted, skipped = insert_jobs(priority)
+    total = count_jobs()
+    print(
+        f"Inserted {inserted}; skipped {skipped}. DB total={total}. "
+        f"Targets: total>={TARGET_MIN}, Support>={SUPPORT_MIN}, Sales>={SALES_MIN}"
+    )
+    return 0 if total >= TARGET_MIN else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
