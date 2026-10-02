@@ -27,11 +27,21 @@ export const metadata: Metadata = {
     'Hand-picked, active remote roles from top global companies. Updated daily.',
 };
 
-export default function RootLayout({ children }: LayoutProps<'/'>) {
+import { AuthModal } from '@/components/AuthModal'
+
+export default function RootLayout({
+  children,
+}: {
+  children: React.ReactNode
+}) {
   return (
-    <html
-      lang="en"
-      className={`${sans.variable} ${mono.variable} h-full antialiased`}
+    <html lang="en">
+      <body>
+        {children}
+      </body>
+    </html>
+  )
+}
     >
       <body className="flex min-h-full flex-col bg-slate-950 font-sans text-slate-100">
         <AnalyticsProvider>
