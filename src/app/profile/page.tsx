@@ -55,7 +55,20 @@ export default function ProfilePage() {
                 <div className="mt-3 space-y-3">
                   <p className="text-white">
                     Signed in as{' '}
-                    <span className="font-semibold">{user.email}</span>
+                    <span className="font-semibold">
+                      {(() => {
+                        const fullName =
+                          (typeof user.user_metadata?.full_name === 'string' &&
+                            user.user_metadata.full_name.trim()) ||
+                          (typeof user.user_metadata?.name === 'string' &&
+                            user.user_metadata.name.trim()) ||
+                          '';
+                        if (fullName && user.email) {
+                          return `${fullName} (${user.email})`;
+                        }
+                        return fullName || user.email || 'your account';
+                      })()}
+                    </span>
                   </p>
                   <button
                     type="button"
