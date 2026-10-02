@@ -163,16 +163,25 @@ export function AuthModal() {
           },
         });
         if (error) throw error;
+
+        // Prefer the session returned by signUp when available
         if (data.session) {
-          // Immediate session — close modal and refresh logged-in UI
           await finalizeSession();
           return;
         }
-        // Email confirmation required — keep message until user dismisses
-        setStatus('done');
-        setMessage(
-          'Account created. Check your inbox to confirm your email, then sign in.'
-        );
+
+        // If email confirmation is enabled, signUp may not return a session —
+        // immediately sign in so the user lands in the logged-in UI.
+        const { data: signedIn, error: signInError } =
+          await supabase.auth.signInWithPassword({
+            email: value,
+            password,
+          });
+        if (signInError) throw signInError;
+        if (!signedIn.session) {
+          throw new Error('Account created but sign-in did not return a session.');
+        }
+        await finalizeSession();
         return;
       }
 
