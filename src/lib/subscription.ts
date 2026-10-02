@@ -1,5 +1,7 @@
 import { createHmac, timingSafeEqual } from 'crypto';
 import { cookies } from 'next/headers';
+import { createClient } from '@/lib/supabase/server';
+import { createAdminSupabase, isMissingRelationError } from '@/lib/supabase';
 
 const COOKIE_NAME = 'rrhq_sub';
 const MAX_AGE_SECONDS = 60 * 60 * 24 * 35; // ~35 days
@@ -55,6 +57,58 @@ export function decodeSubscriberCookie(value: string | undefined): SubscriberSes
 export async function getSubscriberSession(): Promise<SubscriberSession | null> {
   const jar = await cookies();
   return decodeSubscriberCookie(jar.get(COOKIE_NAME)?.value);
+}
+
+/** Cookie entitlement, or an active/trialing Supabase subscription for the signed-in user. */
+export async function getEffectiveSubscriberSession(): Promise<SubscriberSession | null> {
+  const fromCookie = await getSubscriberSession();
+  if (fromCookie) return fromCookie;
+
+  try {
+    const supabase = await createClient();
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+    const email = user?.email?.trim().toLowerCase();
+    if (!email) return null;
+
+    const admin = createAdminSupabase();
+    const { data, error } = await admin
+      .from('subscriptions')
+      .select('email, status, plan, current_period_end')
+      .eq('email', email)
+      .in('status', ['active', 'trialing'])
+      .order('current_period_end', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) {
+      if (!isMissingRelationError(error)) {
+        console.warn('[subscription] DB lookup failed:', error.message);
+      }
+      return null;
+    }
+    if (!data) return null;
+
+    const exp = data.current_period_end
+      ? new Date(data.current_period_end).getTime()
+      : Date.now() + 30 * 24 * 60 * 60 * 1000;
+    if (Date.now() > exp) return null;
+
+    const status: 'active' | 'trialing' =
+      data.status === 'trialing' ? 'trialing' : 'active';
+    const plan: 'trial' | 'monthly' =
+      data.plan === 'trial' || status === 'trialing' ? 'trial' : 'monthly';
+
+    return {
+      email,
+      status,
+      plan,
+      exp,
+    };
+  } catch {
+    return null;
+  }
 }
 
 export async function setSubscriberCookie(session: SubscriberSession): Promise<void> {

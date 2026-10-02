@@ -3,7 +3,7 @@ import { JobBoard } from '@/components/JobBoard';
 import { SiteFooter } from '@/components/SiteFooter';
 import { SiteHeader } from '@/components/SiteHeader';
 import { createAdminSupabase, supabase } from '@/lib/supabase';
-import { getSubscriberSession } from '@/lib/subscription';
+import { getEffectiveSubscriberSession } from '@/lib/subscription';
 import {
   applicantsToday,
   deriveBadges,
@@ -23,7 +23,7 @@ const TRUST_ITEMS = [
 ] as const;
 
 export default async function Home() {
-  const subscriber = await getSubscriberSession();
+  const subscriber = await getEffectiveSubscriberSession();
   const isSubscriber = Boolean(subscriber);
 
   let jobs: Job[] = [];

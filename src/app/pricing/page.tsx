@@ -1,6 +1,6 @@
 import Link from 'next/link';
 import { CheckoutButton } from '@/components/CheckoutButton';
-import { getSubscriberSession } from '@/lib/subscription';
+import { getEffectiveSubscriberSession } from '@/lib/subscription';
 
 export const dynamic = 'force-dynamic';
 
@@ -10,7 +10,7 @@ export default async function PricingPage({
   searchParams: Promise<{ canceled?: string }>;
 }) {
   const params = await searchParams;
-  const session = await getSubscriberSession();
+  const session = await getEffectiveSubscriberSession();
 
   return (
     <main className="flex-1">
