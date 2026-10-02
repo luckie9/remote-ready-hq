@@ -18,8 +18,9 @@ export async function POST(request: Request) {
     const email = body.email?.trim().toLowerCase();
 
     const stripe = getStripe();
+    // Prefer env; fall back to hardcoded $1.97 trial price ID
     const monthlyPrice = STRIPE_PRICES.monthly;
-    const trialPrice = STRIPE_PRICES.trial;
+    const trialPrice = STRIPE_PRICES.trial || monthlyPrice;
 
     if (!monthlyPrice) {
       return Response.json(
@@ -34,13 +35,8 @@ export async function POST(request: Request) {
 
     // Paid trial: charge $1.97 immediately as a one-time line item while
     // starting the monthly subscription after a 3-day trial window.
-    if (plan === 'trial') {
-      if (!trialPrice) {
-        return Response.json(
-          { error: 'STRIPE_PRICE_ID_TRIAL is not configured' },
-          { status: 500 }
-        );
-      }
+    // Skip duplicate when monthly env already points at the trial price.
+    if (plan === 'trial' && trialPrice && trialPrice !== monthlyPrice) {
       lineItems.push({ price: trialPrice, quantity: 1 });
     }
 
