@@ -3,9 +3,14 @@ import Stripe from 'stripe';
 let stripeSingleton: Stripe | null = null;
 
 export function getStripe(): Stripe {
-  const key = process.env.STRIPE_SECRET_KEY;
+  const key =
+    process.env.STRIPE_SECRET_KEY ||
+    process.env.STRIPE_API_KEY ||
+    process.env.STRIPE_SECRET;
   if (!key) {
-    throw new Error('Missing STRIPE_SECRET_KEY');
+    throw new Error(
+      'Missing STRIPE_SECRET_KEY (set it in .env.local / Vercel env)'
+    );
   }
   if (!stripeSingleton) {
     stripeSingleton = new Stripe(key, {

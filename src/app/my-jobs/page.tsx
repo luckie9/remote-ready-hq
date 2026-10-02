@@ -2,7 +2,10 @@ import Link from 'next/link';
 import { SiteFooter } from '@/components/SiteFooter';
 import { SiteHeader } from '@/components/SiteHeader';
 import { createClient } from '@/lib/supabase/server';
-import { createAdminSupabase } from '@/lib/supabase';
+import {
+  createAdminSupabase,
+  isMissingRelationError,
+} from '@/lib/supabase';
 import {
   formatLocation,
   formatRelativeTime,
@@ -29,22 +32,50 @@ export default async function MyJobsPage() {
     applied_at: string;
   }[] = [];
   let loadError: string | null = null;
+  let tableMissing = false;
 
   if (user) {
     try {
-      const admin = createAdminSupabase();
-      const { data, error } = await admin
-        .from('user_applications')
-        .select(
-          'job_id, applied_at, jobs ( id, title, company, location, salary, apply_url, created_at, description )'
-        )
-        .eq('user_id', user.id)
-        .order('applied_at', { ascending: false });
+      let data: AppliedRow[] | null = null;
+      let error: { code?: string; message?: string } | null = null;
+
+      try {
+        const admin = createAdminSupabase();
+        const res = await admin
+          .from('user_applications')
+          .select(
+            'job_id, applied_at, jobs ( id, title, company, location, salary, apply_url, created_at, description )'
+          )
+          .eq('user_id', user.id)
+          .order('applied_at', { ascending: false });
+        data = (res.data as AppliedRow[] | null) ?? null;
+        error = res.error;
+      } catch (adminErr) {
+        // Admin client may throw if secret env is missing — fall back to RLS client
+        const res = await supabase
+          .from('user_applications')
+          .select(
+            'job_id, applied_at, jobs ( id, title, company, location, salary, apply_url, created_at, description )'
+          )
+          .eq('user_id', user.id)
+          .order('applied_at', { ascending: false });
+        data = (res.data as AppliedRow[] | null) ?? null;
+        error =
+          res.error ??
+          (adminErr instanceof Error
+            ? { message: adminErr.message }
+            : { message: 'Failed to load applications' });
+      }
 
       if (error) {
-        loadError = error.message;
+        if (isMissingRelationError(error)) {
+          tableMissing = true;
+          rows = [];
+        } else {
+          loadError = error.message || 'Failed to load My Jobs';
+        }
       } else {
-        rows = ((data ?? []) as AppliedRow[])
+        rows = (data ?? [])
           .map((row) => {
             const job = Array.isArray(row.jobs) ? row.jobs[0] : row.jobs;
             if (!job) return null;
@@ -53,7 +84,13 @@ export default async function MyJobsPage() {
           .filter(Boolean) as { job: Job; applied_at: string }[];
       }
     } catch (err) {
-      loadError = err instanceof Error ? err.message : 'Failed to load My Jobs';
+      const message =
+        err instanceof Error ? err.message : 'Failed to load My Jobs';
+      if (isMissingRelationError({ message })) {
+        tableMissing = true;
+      } else {
+        loadError = message;
+      }
     }
   }
 
@@ -73,7 +110,9 @@ export default async function MyJobsPage() {
 
         {!user ? (
           <div className="rounded-2xl border border-slate-800 bg-slate-900 px-6 py-14 text-center">
-            <p className="text-lg font-semibold text-white">Sign in to track applications</p>
+            <p className="text-lg font-semibold text-white">
+              Sign in to track applications
+            </p>
             <p className="mt-2 text-sm text-slate-400">
               Use the Sign In button in the header with your email and password.
             </p>
@@ -84,12 +123,32 @@ export default async function MyJobsPage() {
               Browse jobs
             </Link>
           </div>
+        ) : tableMissing ? (
+          <div className="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-6 py-10 text-center">
+            <p className="text-lg font-semibold text-amber-100">
+              Application tracking isn&apos;t set up yet
+            </p>
+            <p className="mt-2 text-sm text-amber-100/80">
+              The <code className="font-mono text-xs">user_applications</code>{' '}
+              table is missing. Run{' '}
+              <code className="font-mono text-xs">scrapers/fix_schema.sql</code>{' '}
+              in the Supabase SQL Editor, then apply to a job again.
+            </p>
+            <div className="mt-6">
+              <Link
+                href="/"
+                className="inline-flex rounded-full border border-amber-500/40 px-4 py-2 text-sm font-medium text-amber-100 hover:bg-amber-500/10"
+              >
+                Browse jobs
+              </Link>
+            </div>
+          </div>
         ) : loadError ? (
           <div className="rounded-2xl border border-red-500/30 bg-red-950/40 px-5 py-4 text-red-200">
             {loadError}
             <p className="mt-2 text-sm text-red-300/80">
-              If tables are missing, run the latest SQL in{' '}
-              <code className="font-mono">scrapers/schema.sql</code>.
+              If tables are missing, run{' '}
+              <code className="font-mono">scrapers/fix_schema.sql</code>.
             </p>
           </div>
         ) : rows.length === 0 ? (
