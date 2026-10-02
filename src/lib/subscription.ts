@@ -59,13 +59,35 @@ export async function getSubscriberSession(): Promise<SubscriberSession | null> 
 
 export async function setSubscriberCookie(session: SubscriberSession): Promise<void> {
   const jar = await cookies();
-  jar.set(COOKIE_NAME, encodeSubscriberCookie(session), {
+  jar.set(COOKIE_NAME, encodeSubscriberCookie(session), subscriberCookieOptions());
+}
+
+export function subscriberCookieOptions(): {
+  httpOnly: boolean;
+  sameSite: 'lax';
+  secure: boolean;
+  path: string;
+  maxAge: number;
+} {
+  return {
     httpOnly: true,
     sameSite: 'lax',
     secure: process.env.NODE_ENV === 'production',
     path: '/',
     maxAge: MAX_AGE_SECONDS,
-  });
+  };
+}
+
+/** Attach entitlement cookie to a Route Handler response (legal cookie write path). */
+export function applySubscriberCookie(
+  response: { cookies: { set: (name: string, value: string, options: object) => void } },
+  session: SubscriberSession
+): void {
+  response.cookies.set(
+    COOKIE_NAME,
+    encodeSubscriberCookie(session),
+    subscriberCookieOptions()
+  );
 }
 
 export async function clearSubscriberCookie(): Promise<void> {
