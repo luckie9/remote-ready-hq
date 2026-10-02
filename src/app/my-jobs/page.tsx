@@ -17,9 +17,14 @@ export const revalidate = 0;
 
 type AppliedRow = {
   job_id: string;
-  applied_at: string;
+  applied_at?: string | null;
+  created_at?: string | null;
   jobs: Job | Job[] | null;
 };
+
+function rowTimestamp(row: AppliedRow): string {
+  return row.applied_at || row.created_at || new Date().toISOString();
+}
 
 export default async function MyJobsPage() {
   const supabase = await createClient();
@@ -31,32 +36,42 @@ export default async function MyJobsPage() {
     job: Job;
     applied_at: string;
   }[] = [];
-  let loadError: string | null = null;
-  let tableMissing = false;
+  let setupHint: string | null = null;
 
   if (user) {
     try {
       let data: AppliedRow[] | null = null;
       let error: { code?: string; message?: string } | null = null;
 
+      const selectCols =
+        'job_id, applied_at, created_at, jobs ( id, title, company, location, salary, apply_url, created_at, description )';
+
       try {
         const admin = createAdminSupabase();
         const res = await admin
           .from('user_applications')
-          .select(
-            'job_id, applied_at, jobs ( id, title, company, location, salary, apply_url, created_at, description )'
-          )
+          .select(selectCols)
           .eq('user_id', user.id)
           .order('applied_at', { ascending: false });
         data = (res.data as AppliedRow[] | null) ?? null;
         error = res.error;
+
+        // If applied_at column missing, retry with created_at only
+        if (error && /applied_at/i.test(error.message || '')) {
+          const retry = await admin
+            .from('user_applications')
+            .select(
+              'job_id, created_at, jobs ( id, title, company, location, salary, apply_url, created_at, description )'
+            )
+            .eq('user_id', user.id)
+            .order('created_at', { ascending: false });
+          data = (retry.data as AppliedRow[] | null) ?? null;
+          error = retry.error;
+        }
       } catch (adminErr) {
-        // Admin client may throw if secret env is missing — fall back to RLS client
         const res = await supabase
           .from('user_applications')
-          .select(
-            'job_id, applied_at, jobs ( id, title, company, location, salary, apply_url, created_at, description )'
-          )
+          .select(selectCols)
           .eq('user_id', user.id)
           .order('applied_at', { ascending: false });
         data = (res.data as AppliedRow[] | null) ?? null;
@@ -69,28 +84,28 @@ export default async function MyJobsPage() {
 
       if (error) {
         if (isMissingRelationError(error)) {
-          tableMissing = true;
+          // Missing table: show empty state + soft setup hint (never a red crash)
           rows = [];
+          setupHint =
+            'Application tracking is not configured yet. Run scrapers/fix_schema.sql in Supabase, then apply to a job.';
         } else {
-          loadError = error.message || 'Failed to load My Jobs';
+          // Soft-fail unknown errors to empty list so UI stays usable
+          rows = [];
+          setupHint = error.message || 'Could not load saved applications right now.';
         }
       } else {
         rows = (data ?? [])
           .map((row) => {
             const job = Array.isArray(row.jobs) ? row.jobs[0] : row.jobs;
             if (!job) return null;
-            return { job, applied_at: row.applied_at };
+            return { job, applied_at: rowTimestamp(row) };
           })
           .filter(Boolean) as { job: Job; applied_at: string }[];
       }
-    } catch (err) {
-      const message =
-        err instanceof Error ? err.message : 'Failed to load My Jobs';
-      if (isMissingRelationError({ message })) {
-        tableMissing = true;
-      } else {
-        loadError = message;
-      }
+    } catch {
+      rows = [];
+      setupHint =
+        'Application tracking is not available right now. You can still browse and unlock jobs.';
     }
   }
 
@@ -123,37 +138,14 @@ export default async function MyJobsPage() {
               Browse jobs
             </Link>
           </div>
-        ) : tableMissing ? (
-          <div className="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-6 py-10 text-center">
-            <p className="text-lg font-semibold text-amber-100">
-              Application tracking isn&apos;t set up yet
-            </p>
-            <p className="mt-2 text-sm text-amber-100/80">
-              The <code className="font-mono text-xs">user_applications</code>{' '}
-              table is missing. Run{' '}
-              <code className="font-mono text-xs">scrapers/fix_schema.sql</code>{' '}
-              in the Supabase SQL Editor, then apply to a job again.
-            </p>
-            <div className="mt-6">
-              <Link
-                href="/"
-                className="inline-flex rounded-full border border-amber-500/40 px-4 py-2 text-sm font-medium text-amber-100 hover:bg-amber-500/10"
-              >
-                Browse jobs
-              </Link>
-            </div>
-          </div>
-        ) : loadError ? (
-          <div className="rounded-2xl border border-red-500/30 bg-red-950/40 px-5 py-4 text-red-200">
-            {loadError}
-            <p className="mt-2 text-sm text-red-300/80">
-              If tables are missing, run{' '}
-              <code className="font-mono">scrapers/fix_schema.sql</code>.
-            </p>
-          </div>
         ) : rows.length === 0 ? (
           <div className="rounded-2xl border border-slate-800 bg-slate-900 px-6 py-14 text-center text-slate-400">
-            No applications yet. Unlock a role and click Apply to save it here.
+            <p>No applications yet. Unlock a role and click Apply to save it here.</p>
+            {setupHint && (
+              <p className="mx-auto mt-3 max-w-md text-xs text-slate-500">
+                {setupHint}
+              </p>
+            )}
             <div className="mt-6">
               <Link
                 href="/"

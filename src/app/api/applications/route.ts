@@ -89,6 +89,7 @@ export async function POST(request: Request) {
       user_id: user.id,
       job_id: jobId,
       applied_at: new Date().toISOString(),
+      created_at: new Date().toISOString(),
     };
 
     let error: { code?: string; message?: string } | null = null;

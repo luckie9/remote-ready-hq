@@ -265,7 +265,7 @@ export function JobCard({
                   className={
                     isSubscriber
                       ? 'inline-flex w-full cursor-pointer items-center justify-center rounded-full bg-emerald-600 px-5 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-emerald-500 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-300 active:scale-[0.98] sm:w-auto'
-                      : 'inline-flex w-full cursor-pointer items-center justify-center rounded-full bg-[#10B981] px-5 py-3 text-sm font-bold text-[#0B0F17] shadow-lg shadow-emerald-950/40 transition hover:bg-emerald-400 hover:brightness-110 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-300 active:scale-[0.98] active:bg-emerald-600 sm:w-auto'
+                      : 'inline-flex w-full cursor-pointer items-center justify-center rounded-full border border-emerald-300/40 bg-[#10B981] px-5 py-3 text-sm font-bold text-[#0B0F17] shadow-[0_0_0_1px_rgba(16,185,129,0.35),0_10px_24px_rgba(16,185,129,0.25)] transition hover:border-emerald-200 hover:bg-emerald-400 hover:brightness-110 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-300 active:scale-[0.98] active:bg-emerald-600 sm:w-auto'
                   }
                 />
               </div>

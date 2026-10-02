@@ -1,67 +1,57 @@
--- Fix / create application-tracking tables for My Jobs
--- Run in Supabase SQL Editor if /my-jobs reports missing public.user_applications
+-- Fix / create public.user_applications for My Jobs tracking
+-- Run in the Supabase SQL Editor, then retry /my-jobs
 
 create extension if not exists "pgcrypto";
 
-create table if not exists public.user_applications (
-  id uuid primary key default gen_random_uuid(),
-  user_id uuid not null references auth.users(id) on delete cascade,
-  job_id uuid not null references public.jobs(id) on delete cascade,
-  applied_at timestamptz not null default now(),
-  unique (user_id, job_id)
+CREATE TABLE IF NOT EXISTS public.user_applications (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL,
+  job_id TEXT NOT NULL,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-create index if not exists user_applications_user_id_idx
-  on public.user_applications (user_id, applied_at desc);
+-- Compatibility with app queries that use applied_at + uniqueness
+ALTER TABLE public.user_applications
+  ADD COLUMN IF NOT EXISTS applied_at TIMESTAMPTZ DEFAULT NOW();
 
-alter table public.user_applications enable row level security;
+UPDATE public.user_applications
+SET applied_at = COALESCE(applied_at, created_at, NOW())
+WHERE applied_at IS NULL;
 
-drop policy if exists "Users read own applications" on public.user_applications;
-create policy "Users read own applications"
-  on public.user_applications for select
-  to authenticated
-  using (auth.uid() = user_id);
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conname = 'user_applications_user_id_job_id_key'
+  ) THEN
+    ALTER TABLE public.user_applications
+      ADD CONSTRAINT user_applications_user_id_job_id_key UNIQUE (user_id, job_id);
+  END IF;
+EXCEPTION
+  WHEN duplicate_table THEN NULL;
+  WHEN unique_violation THEN NULL;
+END $$;
 
-drop policy if exists "Users insert own applications" on public.user_applications;
-create policy "Users insert own applications"
-  on public.user_applications for insert
-  to authenticated
-  with check (auth.uid() = user_id);
+CREATE INDEX IF NOT EXISTS user_applications_user_id_idx
+  ON public.user_applications (user_id, applied_at DESC);
 
-drop policy if exists "Users delete own applications" on public.user_applications;
-create policy "Users delete own applications"
-  on public.user_applications for delete
-  to authenticated
-  using (auth.uid() = user_id);
+ALTER TABLE public.user_applications ENABLE ROW LEVEL SECURITY;
 
--- Also ensure job_alerts exists for lead capture
-create table if not exists public.job_alerts (
-  id uuid primary key default gen_random_uuid(),
-  email text not null unique,
-  source text not null default 'popup',
-  daily_enabled boolean not null default true,
-  created_at timestamptz not null default now()
-);
+DROP POLICY IF EXISTS "Users read own applications" ON public.user_applications;
+CREATE POLICY "Users read own applications"
+  ON public.user_applications FOR SELECT
+  TO authenticated
+  USING (auth.uid() = user_id);
 
-create unique index if not exists job_alerts_email_lower_uidx
-  on public.job_alerts (lower(email));
+DROP POLICY IF EXISTS "Users insert own applications" ON public.user_applications;
+CREATE POLICY "Users insert own applications"
+  ON public.user_applications FOR INSERT
+  TO authenticated
+  WITH CHECK (auth.uid() = user_id);
 
-alter table public.job_alerts enable row level security;
-
-drop policy if exists "Anyone can subscribe to job alerts" on public.job_alerts;
-create policy "Anyone can subscribe to job alerts"
-  on public.job_alerts for insert
-  to anon, authenticated
-  with check (true);
-
-drop policy if exists "Users can read own job alerts" on public.job_alerts;
-create policy "Users can read own job alerts"
-  on public.job_alerts for select
-  to authenticated
-  using (lower(email) = lower(coalesce(auth.jwt() ->> 'email', '')));
-
-drop policy if exists "Users can update own job alerts" on public.job_alerts;
-create policy "Users can update own job alerts"
-  on public.job_alerts for update
-  to authenticated
-  using (lower(email) = lower(coalesce(auth.jwt() ->> 'email', '')));
+DROP POLICY IF EXISTS "Users delete own applications" ON public.user_applications;
+CREATE POLICY "Users delete own applications"
+  ON public.user_applications FOR DELETE
+  TO authenticated
+  USING (auth.uid() = user_id);
