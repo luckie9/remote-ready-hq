@@ -163,18 +163,16 @@ export function AuthModal() {
           },
         });
         if (error) throw error;
-        setStatus('done');
         if (data.session) {
-          setMessage('Account created — you are signed in.');
-          window.setTimeout(() => {
-            void finalizeSession();
-          }, 600);
-        } else {
-          setMessage(
-            'Account created. Check your inbox to confirm your email, then sign in.'
-          );
-          window.setTimeout(() => closeAuth(), 1800);
+          // Immediate session — close modal and refresh logged-in UI
+          await finalizeSession();
+          return;
         }
+        // Email confirmation required — keep message until user dismisses
+        setStatus('done');
+        setMessage(
+          'Account created. Check your inbox to confirm your email, then sign in.'
+        );
         return;
       }
 
@@ -186,11 +184,7 @@ export function AuthModal() {
       if (!data.session) {
         throw new Error('Sign-in succeeded but no session was returned.');
       }
-      setStatus('done');
-      setMessage('Signed in successfully.');
-      window.setTimeout(() => {
-        void finalizeSession();
-      }, 400);
+      await finalizeSession();
     } catch (err) {
       setStatus('error');
       setMessage(err instanceof Error ? err.message : 'Authentication failed');
@@ -268,9 +262,18 @@ export function AuthModal() {
         </div>
 
         {status === 'done' ? (
-          <p className="mt-6 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-300">
-            {message}
-          </p>
+          <div className="mt-6 space-y-4">
+            <p className="rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-300">
+              {message}
+            </p>
+            <button
+              type="button"
+              onClick={closeAuth}
+              className="inline-flex w-full items-center justify-center rounded-full border border-slate-600 bg-[#0D131F] px-5 py-2.5 text-sm font-semibold text-slate-200 transition hover:border-emerald-500/40 hover:text-emerald-300"
+            >
+              Dismiss
+            </button>
+          </div>
         ) : (
           <form className="mt-6 space-y-3" onSubmit={onSubmit}>
             {mode === 'signup' && (
