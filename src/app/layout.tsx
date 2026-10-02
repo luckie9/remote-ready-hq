@@ -1,4 +1,5 @@
 import type { Metadata } from 'next';
+import type { ReactNode } from 'react';
 import { JetBrains_Mono, Plus_Jakarta_Sans } from 'next/font/google';
 import { AnalyticsProvider } from '@/components/AnalyticsProvider';
 import { AuthProvider } from '@/components/AuthProvider';
@@ -27,21 +28,11 @@ export const metadata: Metadata = {
     'Hand-picked, active remote roles from top global companies. Updated daily.',
 };
 
-import { AuthModal } from '@/components/AuthModal'
-
-export default function RootLayout({
-  children,
-}: {
-  children: React.ReactNode
-}) {
+export default function RootLayout({ children }: { children: ReactNode }) {
   return (
-    <html lang="en">
-      <body>
-        {children}
-      </body>
-    </html>
-  )
-}
+    <html
+      lang="en"
+      className={`${sans.variable} ${mono.variable} h-full antialiased`}
     >
       <body className="flex min-h-full flex-col bg-slate-950 font-sans text-slate-100">
         <AnalyticsProvider>

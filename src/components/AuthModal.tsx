@@ -1,76 +1,192 @@
-'use client'
+'use client';
 
-import { useState } from 'react'
-import { createClient } from '@supabase/supabase-js'
+import { useEffect, useState, type FormEvent } from 'react';
+import { createClient } from '@/lib/supabase/client';
+import { useAuth } from '@/components/AuthProvider';
 
-const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-)
+type Mode = 'signin' | 'signup';
 
-export function AuthModal({ isOpen, onClose }: { isOpen: boolean; onClose: () => void }) {
-  const [email, setEmail] = useState('')
-  const [password, setPassword] = useState('')
-  const [isSignUp, setIsSignUp] = useState(false)
-  const [message, setMessage] = useState('')
+export function AuthModal() {
+  const { authOpen, closeAuth } = useAuth();
+  const [mode, setMode] = useState<Mode>('signin');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [status, setStatus] = useState<'idle' | 'loading' | 'done' | 'error'>(
+    'idle'
+  );
+  const [message, setMessage] = useState('');
 
-  if (!isOpen) return null
+  useEffect(() => {
+    if (!authOpen) {
+      setMode('signin');
+      setEmail('');
+      setPassword('');
+      setStatus('idle');
+      setMessage('');
+    }
+  }, [authOpen]);
 
-  const handleAuth = async (e: React.FormEvent) => {
-    e.preventDefault()
-    setMessage('')
+  if (!authOpen) return null;
 
-    if (isSignUp) {
-      const { error } = await supabase.auth.signUp({ email, password })
-      if (error) setMessage(error.message)
-      else setMessage('Account created! You can now log in.')
-    } else {
-      const { error } = await supabase.auth.signInWithPassword({ email, password })
-      if (error) setMessage(error.message)
-      else onClose()
+  async function onSubmit(e: FormEvent) {
+    e.preventDefault();
+    const value = email.trim().toLowerCase();
+    if (!value || !password) return;
+    setStatus('loading');
+    setMessage('');
+    try {
+      const supabase = createClient();
+      if (mode === 'signup') {
+        const { error } = await supabase.auth.signUp({
+          email: value,
+          password,
+        });
+        if (error) throw error;
+        setStatus('done');
+        setMessage(
+          'Account created. If email confirmation is enabled, check your inbox — otherwise you’re signed in.'
+        );
+        window.setTimeout(() => closeAuth(), 1400);
+        return;
+      }
+
+      const { error } = await supabase.auth.signInWithPassword({
+        email: value,
+        password,
+      });
+      if (error) throw error;
+      setStatus('done');
+      setMessage('Signed in successfully.');
+      window.setTimeout(() => closeAuth(), 800);
+    } catch (err) {
+      setStatus('error');
+      setMessage(err instanceof Error ? err.message : 'Authentication failed');
     }
   }
 
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
-      <div className="bg-slate-900 border border-slate-800 p-6 rounded-xl max-w-md w-full text-white">
-        <h2 className="text-xl font-bold mb-4">{isSignUp ? 'Create Account' : 'Sign In'}</h2>
-        
-        <form onSubmit={handleAuth} className="space-y-4">
-          <input
-            type="email"
-            placeholder="Email"
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-            className="w-full p-2 rounded bg-slate-800 border border-slate-700 text-white"
-            required
-          />
-          <input
-            type="password"
-            placeholder="Password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            className="w-full p-2 rounded bg-slate-800 border border-slate-700 text-white"
-            required
-          />
-          <button type="submit" className="w-full py-2 bg-emerald-600 rounded font-medium hover:bg-emerald-500">
-            {isSignUp ? 'Sign Up' : 'Sign In'}
+    <div
+      className="fixed inset-0 z-[80] flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm"
+      role="dialog"
+      aria-modal
+      aria-labelledby="auth-modal-title"
+      onClick={closeAuth}
+    >
+      <div
+        className="w-full max-w-md rounded-2xl border border-slate-700 bg-[#161F2E] p-6 shadow-2xl shadow-black/40"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <h2
+              id="auth-modal-title"
+              className="text-xl font-semibold tracking-tight text-white"
+            >
+              {mode === 'signin' ? 'Sign in to RemoteReady HQ' : 'Create your account'}
+            </h2>
+            <p className="mt-1 text-sm text-slate-400">
+              Email and password — track applied jobs and unlock My Jobs.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={closeAuth}
+            className="rounded-lg border border-slate-700 px-2 py-1 text-sm text-slate-400 hover:text-white"
+            aria-label="Close"
+          >
+            ✕
           </button>
-        </form>
+        </div>
 
-        {message && <p className="mt-4 text-sm text-amber-400">{message}</p>}
+        <div className="mt-5 grid grid-cols-2 gap-2 rounded-xl border border-slate-700 bg-slate-950/60 p-1">
+          <button
+            type="button"
+            onClick={() => {
+              setMode('signin');
+              setStatus('idle');
+              setMessage('');
+            }}
+            className={`rounded-lg px-3 py-2 text-sm font-semibold transition ${
+              mode === 'signin'
+                ? 'bg-emerald-500 text-[#0B0F17]'
+                : 'text-slate-400 hover:text-white'
+            }`}
+          >
+            Sign In
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setMode('signup');
+              setStatus('idle');
+              setMessage('');
+            }}
+            className={`rounded-lg px-3 py-2 text-sm font-semibold transition ${
+              mode === 'signup'
+                ? 'bg-emerald-500 text-[#0B0F17]'
+                : 'text-slate-400 hover:text-white'
+            }`}
+          >
+            Sign Up
+          </button>
+        </div>
 
-        <button
-          onClick={() => setIsSignUp(!isSignUp)}
-          className="mt-4 text-xs text-slate-400 hover:underline block text-center w-full"
-        >
-          {isSignUp ? 'Already have an account? Sign In' : "Don't have an account? Sign Up"}
-        </button>
-        
-        <button onClick={onClose} className="mt-2 text-xs text-slate-500 block text-center w-full">
-          Close
-        </button>
+        {status === 'done' ? (
+          <p className="mt-6 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-300">
+            {message}
+          </p>
+        ) : (
+          <form className="mt-6 space-y-3" onSubmit={onSubmit}>
+            <label className="block">
+              <span className="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-slate-500">
+                Email
+              </span>
+              <input
+                type="email"
+                required
+                autoComplete="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                placeholder="you@company.com"
+                className="w-full rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm text-white outline-none placeholder:text-slate-500 focus:border-emerald-500/40"
+              />
+            </label>
+            <label className="block">
+              <span className="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-slate-500">
+                Password
+              </span>
+              <input
+                type="password"
+                required
+                minLength={6}
+                autoComplete={
+                  mode === 'signin' ? 'current-password' : 'new-password'
+                }
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder="At least 6 characters"
+                className="w-full rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm text-white outline-none placeholder:text-slate-500 focus:border-emerald-500/40"
+              />
+            </label>
+            <button
+              type="submit"
+              disabled={status === 'loading'}
+              className="inline-flex w-full items-center justify-center rounded-full bg-emerald-600 px-5 py-2.5 text-sm font-bold text-white transition hover:bg-emerald-500 disabled:opacity-60"
+            >
+              {status === 'loading'
+                ? mode === 'signin'
+                  ? 'Signing in…'
+                  : 'Creating account…'
+                : mode === 'signin'
+                  ? 'Sign In'
+                  : 'Create Account'}
+            </button>
+            {status === 'error' && (
+              <p className="text-sm text-red-400">{message}</p>
+            )}
+          </form>
+        )}
       </div>
     </div>
-  )
+  );
 }

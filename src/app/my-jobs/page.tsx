@@ -75,7 +75,7 @@ export default async function MyJobsPage() {
           <div className="rounded-2xl border border-slate-800 bg-slate-900 px-6 py-14 text-center">
             <p className="text-lg font-semibold text-white">Sign in to track applications</p>
             <p className="mt-2 text-sm text-slate-400">
-              Use the Sign In button in the header for a magic link.
+              Use the Sign In button in the header with your email and password.
             </p>
             <Link
               href="/"
