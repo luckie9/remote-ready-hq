@@ -2,10 +2,7 @@ import Link from 'next/link';
 import { SiteFooter } from '@/components/SiteFooter';
 import { SiteHeader } from '@/components/SiteHeader';
 import { createClient } from '@/lib/supabase/server';
-import {
-  createAdminSupabase,
-  isMissingRelationError,
-} from '@/lib/supabase';
+import { createAdminSupabase } from '@/lib/supabase';
 import {
   formatLocation,
   formatRelativeTime,
@@ -26,88 +23,75 @@ function rowTimestamp(row: AppliedRow): string {
   return row.applied_at || row.created_at || new Date().toISOString();
 }
 
+/**
+ * Load applied jobs for the signed-in user.
+ * Any missing-table / schema / query failure soft-fails to [].
+ */
+async function loadAppliedJobs(userId: string): Promise<
+  { job: Job; applied_at: string }[]
+> {
+  const selectCols =
+    'job_id, applied_at, created_at, jobs ( id, title, company, location, salary, apply_url, created_at, description )';
+
+  try {
+    let data: AppliedRow[] | null = null;
+    let error: { code?: string; message?: string } | null = null;
+
+    try {
+      const admin = createAdminSupabase();
+      const res = await admin
+        .from('user_applications')
+        .select(selectCols)
+        .eq('user_id', userId)
+        .order('applied_at', { ascending: false });
+      data = (res.data as AppliedRow[] | null) ?? null;
+      error = res.error;
+
+      // If applied_at column missing, retry with created_at only
+      if (error && /applied_at/i.test(error.message || '')) {
+        const retry = await admin
+          .from('user_applications')
+          .select(
+            'job_id, created_at, jobs ( id, title, company, location, salary, apply_url, created_at, description )'
+          )
+          .eq('user_id', userId)
+          .order('created_at', { ascending: false });
+        data = (retry.data as AppliedRow[] | null) ?? null;
+        error = retry.error;
+      }
+    } catch {
+      const supabase = await createClient();
+      const res = await supabase
+        .from('user_applications')
+        .select(selectCols)
+        .eq('user_id', userId)
+        .order('applied_at', { ascending: false });
+      data = (res.data as AppliedRow[] | null) ?? null;
+      error = res.error;
+    }
+
+    // Missing table, RLS, or any query error → empty list (no UI warning)
+    if (error) return [];
+
+    return (data ?? [])
+      .map((row) => {
+        const job = Array.isArray(row.jobs) ? row.jobs[0] : row.jobs;
+        if (!job) return null;
+        return { job, applied_at: rowTimestamp(row) };
+      })
+      .filter(Boolean) as { job: Job; applied_at: string }[];
+  } catch {
+    return [];
+  }
+}
+
 export default async function MyJobsPage() {
   const supabase = await createClient();
   const {
     data: { user },
   } = await supabase.auth.getUser();
 
-  let rows: {
-    job: Job;
-    applied_at: string;
-  }[] = [];
-  let setupHint: string | null = null;
-
-  if (user) {
-    try {
-      let data: AppliedRow[] | null = null;
-      let error: { code?: string; message?: string } | null = null;
-
-      const selectCols =
-        'job_id, applied_at, created_at, jobs ( id, title, company, location, salary, apply_url, created_at, description )';
-
-      try {
-        const admin = createAdminSupabase();
-        const res = await admin
-          .from('user_applications')
-          .select(selectCols)
-          .eq('user_id', user.id)
-          .order('applied_at', { ascending: false });
-        data = (res.data as AppliedRow[] | null) ?? null;
-        error = res.error;
-
-        // If applied_at column missing, retry with created_at only
-        if (error && /applied_at/i.test(error.message || '')) {
-          const retry = await admin
-            .from('user_applications')
-            .select(
-              'job_id, created_at, jobs ( id, title, company, location, salary, apply_url, created_at, description )'
-            )
-            .eq('user_id', user.id)
-            .order('created_at', { ascending: false });
-          data = (retry.data as AppliedRow[] | null) ?? null;
-          error = retry.error;
-        }
-      } catch (adminErr) {
-        const res = await supabase
-          .from('user_applications')
-          .select(selectCols)
-          .eq('user_id', user.id)
-          .order('applied_at', { ascending: false });
-        data = (res.data as AppliedRow[] | null) ?? null;
-        error =
-          res.error ??
-          (adminErr instanceof Error
-            ? { message: adminErr.message }
-            : { message: 'Failed to load applications' });
-      }
-
-      if (error) {
-        if (isMissingRelationError(error)) {
-          // Missing table: show empty state + soft setup hint (never a red crash)
-          rows = [];
-          setupHint =
-            'Application tracking is not configured yet. Run scrapers/fix_schema.sql in Supabase, then apply to a job.';
-        } else {
-          // Soft-fail unknown errors to empty list so UI stays usable
-          rows = [];
-          setupHint = error.message || 'Could not load saved applications right now.';
-        }
-      } else {
-        rows = (data ?? [])
-          .map((row) => {
-            const job = Array.isArray(row.jobs) ? row.jobs[0] : row.jobs;
-            if (!job) return null;
-            return { job, applied_at: rowTimestamp(row) };
-          })
-          .filter(Boolean) as { job: Job; applied_at: string }[];
-      }
-    } catch {
-      rows = [];
-      setupHint =
-        'Application tracking is not available right now. You can still browse and unlock jobs.';
-    }
-  }
+  const rows = user ? await loadAppliedJobs(user.id) : [];
 
   return (
     <main className="flex-1 bg-slate-950 text-slate-100">
@@ -141,11 +125,6 @@ export default async function MyJobsPage() {
         ) : rows.length === 0 ? (
           <div className="rounded-2xl border border-slate-800 bg-slate-900 px-6 py-14 text-center text-slate-400">
             <p>No applications yet. Unlock a role and click Apply to save it here.</p>
-            {setupHint && (
-              <p className="mx-auto mt-3 max-w-md text-xs text-slate-500">
-                {setupHint}
-              </p>
-            )}
             <div className="mt-6">
               <Link
                 href="/"

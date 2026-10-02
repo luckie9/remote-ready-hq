@@ -38,34 +38,16 @@ export async function GET() {
     }
 
     if (error) {
-      if (isMissingRelationError(error)) {
-        return NextResponse.json({
-          jobIds: [],
-          rows: [],
-          tableMissing: true,
-        });
-      }
-      return NextResponse.json(
-        { error: error.message, jobIds: [] },
-        { status: 500 }
-      );
+      // Missing table or any query failure → empty list (no client warning)
+      return NextResponse.json({ jobIds: [], rows: [] });
     }
 
     return NextResponse.json({
       jobIds: (data ?? []).map((row) => row.job_id as string),
       rows: data ?? [],
     });
-  } catch (err) {
-    const message =
-      err instanceof Error ? err.message : 'Failed to load applications';
-    if (isMissingRelationError({ message })) {
-      return NextResponse.json({
-        jobIds: [],
-        rows: [],
-        tableMissing: true,
-      });
-    }
-    return NextResponse.json({ error: message, jobIds: [] }, { status: 500 });
+  } catch {
+    return NextResponse.json({ jobIds: [], rows: [] });
   }
 }
 
@@ -108,15 +90,8 @@ export async function POST(request: Request) {
 
     if (error) {
       if (isMissingRelationError(error)) {
-        return NextResponse.json(
-          {
-            error:
-              'Application tracking table is missing. Run scrapers/fix_schema.sql in Supabase.',
-            tableMissing: true,
-            ok: false,
-          },
-          { status: 503 }
-        );
+        // Table not provisioned yet — don't surface schema copy to clients
+        return NextResponse.json({ ok: false, jobIds: [] });
       }
       return NextResponse.json({ error: error.message }, { status: 500 });
     }
