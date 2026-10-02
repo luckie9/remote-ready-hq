@@ -133,6 +133,10 @@ export function AuthModal() {
 
   async function onSubmit(e: FormEvent) {
     e.preventDefault();
+    // Clear any previous error/success so stale messages never linger
+    setStatus('idle');
+    setMessage('');
+
     const value = email.trim().toLowerCase();
     const name = fullName.trim();
     if (!value || !password) return;
@@ -164,25 +168,22 @@ export function AuthModal() {
         });
         if (error) throw error;
 
-        // Prefer the session returned by signUp when available
+        // Auto-confirm enabled in Supabase — session present, sign them in
         if (data.session) {
           await finalizeSession();
           return;
         }
 
-        // If email confirmation is enabled, signUp may not return a session —
-        // immediately sign in so the user lands in the logged-in UI.
-        const { data: signedIn, error: signInError } =
-          await supabase.auth.signInWithPassword({
-            email: value,
-            password,
-          });
-        if (signInError) throw signInError;
-        if (!signedIn.session) {
-          throw new Error('Account created but sign-in did not return a session.');
+        // Email confirmation required — do not auto sign-in
+        if (data.user) {
+          setStatus('done');
+          setMessage(
+            'Account created! Please check your email to confirm your account.'
+          );
+          return;
         }
-        await finalizeSession();
-        return;
+
+        throw new Error('Unable to create account. Please try again.');
       }
 
       const { data, error } = await supabase.auth.signInWithPassword({
