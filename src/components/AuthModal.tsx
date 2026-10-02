@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useState, type FormEvent } from 'react';
+import { useRouter } from 'next/navigation';
 import { createClient } from '@/lib/supabase/client';
 import { useAuth } from '@/components/AuthProvider';
 
@@ -94,7 +95,8 @@ function PasswordField({
 }
 
 export function AuthModal() {
-  const { authOpen, closeAuth } = useAuth();
+  const router = useRouter();
+  const { authOpen, closeAuth, refreshApplications } = useAuth();
   const [mode, setMode] = useState<Mode>('signin');
   const [fullName, setFullName] = useState('');
   const [email, setEmail] = useState('');
@@ -120,6 +122,12 @@ export function AuthModal() {
       setMessage('');
     }
   }, [authOpen]);
+
+  async function finalizeSession() {
+    closeAuth();
+    await refreshApplications();
+    router.refresh();
+  }
 
   if (!authOpen) return null;
 
@@ -147,7 +155,7 @@ export function AuthModal() {
     try {
       const supabase = createClient();
       if (mode === 'signup') {
-        const { error } = await supabase.auth.signUp({
+        const { data, error } = await supabase.auth.signUp({
           email: value,
           password,
           options: {
@@ -156,21 +164,33 @@ export function AuthModal() {
         });
         if (error) throw error;
         setStatus('done');
-        setMessage(
-          'Account created. If email confirmation is enabled, check your inbox — otherwise you’re signed in.'
-        );
-        window.setTimeout(() => closeAuth(), 1400);
+        if (data.session) {
+          setMessage('Account created — you are signed in.');
+          window.setTimeout(() => {
+            void finalizeSession();
+          }, 600);
+        } else {
+          setMessage(
+            'Account created. Check your inbox to confirm your email, then sign in.'
+          );
+          window.setTimeout(() => closeAuth(), 1800);
+        }
         return;
       }
 
-      const { error } = await supabase.auth.signInWithPassword({
+      const { data, error } = await supabase.auth.signInWithPassword({
         email: value,
         password,
       });
       if (error) throw error;
+      if (!data.session) {
+        throw new Error('Sign-in succeeded but no session was returned.');
+      }
       setStatus('done');
       setMessage('Signed in successfully.');
-      window.setTimeout(() => closeAuth(), 800);
+      window.setTimeout(() => {
+        void finalizeSession();
+      }, 400);
     } catch (err) {
       setStatus('error');
       setMessage(err instanceof Error ? err.message : 'Authentication failed');
