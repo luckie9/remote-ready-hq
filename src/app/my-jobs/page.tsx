@@ -100,10 +100,11 @@ export default async function MyJobsPage() {
 
         <div className="mx-auto max-w-3xl pt-12 pb-8">
           <h1 className="text-3xl font-extrabold tracking-tight text-white">
-            My Jobs
+            Saved &amp; Applied Jobs
           </h1>
           <p className="mt-2 text-slate-400">
-            Roles you&apos;ve unlocked or marked as applied — newest first.
+            Keep track of all the remote roles you&apos;ve unlocked or applied
+            to.
           </p>
         </div>
 
@@ -119,18 +120,25 @@ export default async function MyJobsPage() {
               href="/"
               className="mt-6 inline-flex rounded-full bg-emerald-600 px-5 py-2.5 text-sm font-semibold text-white hover:bg-emerald-500"
             >
-              Browse jobs
+              Browse Open Roles
             </Link>
           </div>
         ) : rows.length === 0 ? (
-          <div className="rounded-2xl border border-slate-800 bg-slate-900 px-6 py-14 text-center text-slate-400">
-            <p>No applications yet. Unlock a role and click Apply to save it here.</p>
+          <div className="rounded-2xl border border-slate-800 bg-slate-900 px-6 py-14 text-center">
+            <p className="text-lg font-semibold text-white">
+              No saved applications yet
+            </p>
+            <p className="mx-auto mt-2 max-w-md text-sm text-slate-400">
+              When you view or click &apos;Apply&apos; on job listings, they
+              will automatically appear here so you can manage your active job
+              search.
+            </p>
             <div className="mt-6">
               <Link
                 href="/"
                 className="inline-flex rounded-full border border-slate-700 px-4 py-2 text-sm font-medium text-slate-200 hover:border-slate-600"
               >
-                Find jobs
+                Browse Open Roles
               </Link>
             </div>
           </div>
