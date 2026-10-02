@@ -1,7 +1,7 @@
 import Link from 'next/link';
 import { redirect } from 'next/navigation';
 import { TrackCheckoutCompleted } from '@/components/TrackCheckoutCompleted';
-import { getStripe } from '@/lib/stripe';
+import { getStripe, PLAN_AMOUNTS } from '@/lib/stripe';
 import { setSubscriberCookie } from '@/lib/subscription';
 import { createAdminSupabase } from '@/lib/supabase';
 
@@ -19,7 +19,7 @@ export default async function SuccessPage({
 
   const stripe = getStripe();
   const session = await stripe.checkout.sessions.retrieve(sessionId, {
-    expand: ['subscription'],
+    expand: ['subscription', 'line_items'],
   });
 
   const email =
@@ -29,32 +29,47 @@ export default async function SuccessPage({
     redirect('/pricing');
   }
 
+  const isPaymentMode = session.mode === 'payment';
   const subscription =
     typeof session.subscription === 'object' && session.subscription
       ? session.subscription
       : null;
 
-  const status: 'active' | 'trialing' =
-    subscription?.status === 'trialing' ? 'trialing' : 'active';
-
-  if (
+  // Payment (one-time $1.97) and subscription modes both land here.
+  if (isPaymentMode) {
+    if (session.payment_status !== 'paid') {
+      redirect('/pricing');
+    }
+  } else if (
     subscription &&
     subscription.status !== 'trialing' &&
     subscription.status !== 'active' &&
     session.payment_status !== 'paid'
   ) {
     redirect('/pricing');
+  } else if (!subscription && session.payment_status !== 'paid') {
+    redirect('/pricing');
   }
 
+  const status: 'active' | 'trialing' = isPaymentMode
+    ? 'trialing'
+    : subscription?.status === 'trialing'
+      ? 'trialing'
+      : 'active';
+
   const plan =
-    session.metadata?.plan === 'monthly' || subscription?.status === 'active'
-      ? 'monthly'
-      : 'trial';
+    isPaymentMode || session.metadata?.plan === 'trial'
+      ? 'trial'
+      : session.metadata?.plan === 'monthly' || subscription?.status === 'active'
+        ? 'monthly'
+        : 'trial';
 
   const itemPeriodEnd = subscription?.items?.data?.[0]?.current_period_end;
   const periodEnd = itemPeriodEnd
     ? itemPeriodEnd * 1000
-    : Date.now() + 7 * 24 * 60 * 60 * 1000;
+    : isPaymentMode
+      ? Date.now() + PLAN_AMOUNTS.trialDays * 24 * 60 * 60 * 1000
+      : Date.now() + 7 * 24 * 60 * 60 * 1000;
 
   await setSubscriberCookie({
     email: email.toLowerCase(),
@@ -68,6 +83,11 @@ export default async function SuccessPage({
     const normalized = email.toLowerCase();
     const customerId =
       typeof session.customer === 'string' ? session.customer : null;
+    const linePriceId =
+      session.line_items?.data?.[0]?.price &&
+      typeof session.line_items.data[0].price === 'object'
+        ? session.line_items.data[0].price.id
+        : null;
 
     const { data: existingUser } = await admin
       .from('users')
@@ -98,7 +118,7 @@ export default async function SuccessPage({
     }
 
     if (userId) {
-      const subId = subscription?.id ?? null;
+      const subId = subscription?.id ?? (isPaymentMode ? session.id : null);
       if (subId) {
         const { data: existingSub } = await admin
           .from('subscriptions')
@@ -110,7 +130,8 @@ export default async function SuccessPage({
           email: normalized,
           stripe_customer_id: customerId,
           stripe_subscription_id: subId,
-          stripe_price_id: subscription?.items?.data?.[0]?.price?.id ?? null,
+          stripe_price_id:
+            subscription?.items?.data?.[0]?.price?.id ?? linePriceId,
           status,
           plan,
           current_period_end: new Date(periodEnd).toISOString(),

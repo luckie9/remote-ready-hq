@@ -129,6 +129,19 @@ export async function POST(request: Request) {
           plan = planFromSubscription(sub);
           currentPeriodEnd = periodEndFromSubscription(sub);
           priceId = sub.items.data[0]?.price?.id ?? null;
+        } else if (session.mode === 'payment') {
+          // One-time $1.97 pass — grant a 3-day access window
+          status = 'trialing';
+          plan = 'trial';
+          currentPeriodEnd =
+            Math.floor(Date.now() / 1000) + 3 * 24 * 60 * 60;
+          stripeSubscriptionId = session.id;
+          const full = await stripe.checkout.sessions.retrieve(session.id, {
+            expand: ['line_items'],
+          });
+          const linePrice = full.line_items?.data?.[0]?.price;
+          priceId =
+            linePrice && typeof linePrice === 'object' ? linePrice.id : null;
         }
 
         await upsertSubscriber({

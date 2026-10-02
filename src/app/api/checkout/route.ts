@@ -18,50 +18,72 @@ export async function POST(request: Request) {
     const email = body.email?.trim().toLowerCase();
 
     const stripe = getStripe();
-    // Prefer env; fall back to hardcoded $1.97 trial price ID
-    const monthlyPrice = STRIPE_PRICES.monthly;
-    const trialPrice = STRIPE_PRICES.trial || monthlyPrice;
+    // Prefer env; fall back to hardcoded $1.97 trial / unlock price ID
+    const monthlyPriceId = STRIPE_PRICES.monthly;
+    const trialPriceId = STRIPE_PRICES.trial || monthlyPriceId;
 
-    if (!monthlyPrice) {
+    if (!monthlyPriceId) {
       return Response.json(
         { error: 'STRIPE_PRICE_ID_MONTHLY is not configured' },
         { status: 500 }
       );
     }
 
-    const lineItems: { price: string; quantity: number }[] = [
-      { price: monthlyPrice, quantity: 1 },
-    ];
+    // Unlock / $1.97 pass uses trial price (or monthly env when trial unset).
+    const primaryPriceId = plan === 'trial' ? trialPriceId : monthlyPriceId;
+    const price = await stripe.prices.retrieve(primaryPriceId);
+    const isRecurring = Boolean(price.recurring);
 
-    // Paid trial: charge $1.97 immediately as a one-time line item while
-    // starting the monthly subscription after a 3-day trial window.
-    // Skip duplicate when monthly env already points at the trial price.
-    if (plan === 'trial' && trialPrice && trialPrice !== monthlyPrice) {
-      lineItems.push({ price: trialPrice, quantity: 1 });
-    }
+    // One-time prices (e.g. $1.97 pass) require payment mode.
+    // Recurring prices use subscription mode.
+    const mode = isRecurring ? 'subscription' : 'payment';
+    const resolvedPlan = mode === 'payment' ? 'trial' : plan;
 
-    const session = await stripe.checkout.sessions.create({
-      mode: 'subscription',
-      customer_email: email || undefined,
-      line_items: lineItems,
-      success_url: `${appUrl()}/success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${appUrl()}/pricing?canceled=1`,
-      allow_promotion_codes: true,
-      subscription_data: {
-        trial_period_days: plan === 'trial' ? 3 : undefined,
-        metadata: {
-          plan,
-          app: 'remote-ready-hq',
-        },
-      },
-      metadata: {
-        plan,
-        app: 'remote-ready-hq',
-      },
-    });
+    const successUrl = `${appUrl()}/success?session_id={CHECKOUT_SESSION_ID}`;
+    const cancelUrl = `${appUrl()}/pricing?canceled=1`;
+
+    const session = await stripe.checkout.sessions.create(
+      mode === 'payment'
+        ? {
+            mode: 'payment',
+            customer_email: email || undefined,
+            line_items: [{ price: primaryPriceId, quantity: 1 }],
+            success_url: successUrl,
+            cancel_url: cancelUrl,
+            allow_promotion_codes: true,
+            metadata: {
+              plan: resolvedPlan,
+              app: 'remote-ready-hq',
+              checkout_mode: 'payment',
+            },
+          }
+        : {
+            mode: 'subscription',
+            customer_email: email || undefined,
+            line_items: [{ price: primaryPriceId, quantity: 1 }],
+            success_url: successUrl,
+            cancel_url: cancelUrl,
+            allow_promotion_codes: true,
+            subscription_data: {
+              trial_period_days: plan === 'trial' ? 3 : undefined,
+              metadata: {
+                plan,
+                app: 'remote-ready-hq',
+              },
+            },
+            metadata: {
+              plan,
+              app: 'remote-ready-hq',
+              checkout_mode: 'subscription',
+            },
+          }
+    );
 
     if (!session.url) {
-      return Response.json({ error: 'Stripe did not return a checkout URL' }, { status: 500 });
+      return Response.json(
+        { error: 'Stripe did not return a checkout URL' },
+        { status: 500 }
+      );
     }
 
     return Response.json({ url: session.url, id: session.id });
