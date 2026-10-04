@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
@@ -155,6 +155,24 @@ OPS_TITLE = re.compile(
 )
 
 
+# Tracking / noise query params stripped during apply_url normalization.
+_TRACKING_PARAMS = frozenset(
+    {
+        "utm_source",
+        "utm_medium",
+        "utm_campaign",
+        "utm_term",
+        "utm_content",
+        "fbclid",
+        "gclid",
+        "mc_cid",
+        "mc_eid",
+        "ref",
+        "ref_src",
+    }
+)
+
+
 @dataclass(frozen=True)
 class JobListing:
     title: str
@@ -172,6 +190,37 @@ class JobListing:
             f"{self.apply_url.strip().lower()}"
         )
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+@dataclass
+class RunStats:
+    """Counters for the structured end-of-run summary."""
+
+    fetched: int = 0
+    deduplicated: int = 0
+    skipped: int = 0
+    inserted: int = 0
+    failed: int = 0
+    critical_error: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.critical_error is None and self.failed == 0
+
+
+@dataclass
+class WriteResult:
+    inserted: int
+    skipped: int
+    failed: int
+
+
+class ExistingKeysFetchError(RuntimeError):
+    """Raised when the existing apply_url preload cannot be completed safely."""
+
+
+class CredentialError(RuntimeError):
+    """Raised when Supabase URL/secret are missing or fail a connectivity probe."""
 
 
 def normalize_whitespace(text: str | None) -> str:
@@ -276,6 +325,37 @@ def stamp_description(description: str, category: str) -> str:
     return f"rrhq_category:{category}\n{body}"
 
 
+def normalize_apply_url(raw: str | None) -> str:
+    """
+    Canonicalize apply URLs for dedupe + DB uniqueness.
+    - https scheme, lowercased host
+    - strip fragment, trailing slash, common tracking params
+    - reject empty / relative paths
+    """
+    value = (raw or "").strip()
+    if not value or value.startswith("/"):
+        return ""
+    if not re.match(r"^https?://", value, flags=re.I):
+        value = "https://" + value.lstrip("/")
+    try:
+        parsed = urlparse(value)
+    except Exception:
+        return ""
+    if not parsed.netloc:
+        return ""
+    scheme = "https"
+    netloc = parsed.netloc.lower()
+    path = (parsed.path or "").rstrip("/")
+    kept = [
+        (k, v)
+        for k, v in parse_qsl(parsed.query, keep_blank_values=True)
+        if k.lower() not in _TRACKING_PARAMS
+    ]
+    kept.sort(key=lambda kv: (kv[0].lower(), kv[1]))
+    query = urlencode(kept, doseq=True)
+    return urlunparse((scheme, netloc, path, "", query, ""))
+
+
 BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -359,6 +439,20 @@ def get_supabase_anon() -> Client | None:
     return create_client(supabase_url=url, supabase_key=anon)
 
 
+def probe_supabase(client: Client | None = None) -> Client:
+    """Validate credentials with a lightweight authenticated read. Raises CredentialError."""
+    try:
+        db = client or get_supabase_admin()
+        db.table("jobs").select("apply_url").limit(1).execute()
+        return db
+    except CredentialError:
+        raise
+    except Exception as e:
+        raise CredentialError(
+            f"Supabase credential/probe failed: {type(e).__name__}: {e}"
+        ) from e
+
+
 def make_listing(
     *,
     title: str,
@@ -371,10 +465,8 @@ def make_listing(
 ) -> JobListing | None:
     title = normalize_whitespace(title)
     company = normalize_whitespace(company) or "Unknown"
-    apply_url = (apply_url or "").strip()
+    apply_url = normalize_apply_url(apply_url)
     if not title or not apply_url:
-        return None
-    if apply_url.startswith("/"):
         return None
     cat = infer_category(title, category)
     return JobListing(
@@ -604,51 +696,63 @@ def scrape_all() -> list[JobListing]:
 
 
 def deduplicate(jobs: Iterable[JobListing]) -> list[JobListing]:
+    """Dedupe on normalized apply_url + title/company fingerprint."""
     by_fp: dict[str, JobListing] = {}
     by_url: set[str] = set()
     for job in jobs:
+        url_key = normalize_apply_url(job.apply_url)
+        if not url_key:
+            continue
+        # Rebuild listing if URL needed re-normalization (defensive).
+        if url_key != job.apply_url:
+            job = JobListing(
+                title=job.title,
+                company=job.company,
+                location=job.location,
+                salary_range=job.salary_range,
+                description=job.description,
+                apply_url=url_key,
+                category=job.category,
+            )
         fp = job.fingerprint()
-        url_key = job.apply_url.strip().lower()
-        try:
-            parsed = urlparse(job.apply_url)
-            host_path = f"{parsed.netloc}{parsed.path}".lower().rstrip("/")
-        except Exception:
-            host_path = url_key
-        if fp in by_fp or url_key in by_url or host_path in by_url:
+        if fp in by_fp or url_key in by_url:
             continue
         by_fp[fp] = job
         by_url.add(url_key)
-        by_url.add(host_path)
     return list(by_fp.values())
 
 
-def fetch_existing_keys(client: Client | None = None) -> set[str]:
-    """Load existing apply_url values via supabase-py (SECRET_KEY). No browser UA."""
+def fetch_existing_keys(client: Client) -> set[str]:
+    """
+    Load existing normalized apply_url keys.
+    Raises ExistingKeysFetchError on any failure — never returns a partial/empty
+    set that would be mistaken for an empty database.
+    """
     existing: set[str] = set()
     page_size = 1_000
     start = 0
-    try:
-        db = client or get_supabase_admin()
-    except Exception as e:
-        print(f"Error scraping target: {e}", flush=True)
-        return existing
     while True:
         try:
             end = start + page_size - 1
             resp = (
-                db.table("jobs")
+                client.table("jobs")
                 .select("apply_url")
                 .range(start, end)
                 .execute()
             )
             rows = resp.data or []
         except Exception as e:
-            print(f"Error scraping target: {e}", flush=True)
-            break
+            raise ExistingKeysFetchError(
+                f"failed loading existing apply_url keys at offset={start}: "
+                f"{type(e).__name__}: {e}"
+            ) from e
         if not isinstance(rows, list):
-            break
+            raise ExistingKeysFetchError(
+                f"unexpected response type for apply_url page at offset={start}: "
+                f"{type(rows)!r}"
+            )
         for row in rows:
-            url = (row.get("apply_url") or "").strip().lower()
+            url = normalize_apply_url(row.get("apply_url") or "")
             if url:
                 existing.add(url)
         if len(rows) < page_size:
@@ -666,60 +770,84 @@ def count_jobs(client: Client | None = None) -> int:
             return int(resp.count)
         return len(resp.data or [])
     except Exception as e:
-        print(f"Error scraping target: {e}", flush=True)
+        _log_err(f"[db] count_jobs failed: {e}")
         return 0
 
 
 def to_row(job: JobListing) -> dict:
+    apply_url = normalize_apply_url(job.apply_url)
     return {
         "title": job.title,
         "company": job.company,
         "location": job.location,
         "salary": job.salary_range,
         "description": job.description,
-        "apply_url": job.apply_url,
+        "apply_url": apply_url,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
 
-def insert_jobs(jobs: list[JobListing]) -> tuple[int, int]:
+def insert_jobs(jobs: list[JobListing], client: Client | None = None) -> WriteResult:
     """
-    Insert new jobs via supabase-py + SECRET_KEY only.
-    Completely detached from Playwright page.evaluate() / browser fetch.
+    Upsert new jobs via supabase-py + SECRET_KEY only.
+    Aborts (raises) if existing-key fetch fails — never treats that as empty DB.
+    Uses ignore_duplicates as a race-safe safety net on unique apply_url conflicts.
     """
-    _log("[scraper] Loading existing apply_url keys from database…")
-    try:
-        db = get_supabase_admin()
-    except Exception as e:
-        print(f"Error scraping target: {e}", flush=True)
-        return 0, len(jobs)
-    try:
-        existing = fetch_existing_keys(db)
-    except Exception as e:
-        print(f"Error scraping target: {e}", flush=True)
-        existing = set()
-    _log(f"[scraper] Found {len(existing)} existing jobs in Supabase")
-    fresh = [j for j in jobs if j.apply_url.strip().lower() not in existing]
+    _log("[db] Loading existing apply_url keys from database…")
+    db = client or get_supabase_admin()
+    existing = fetch_existing_keys(db)
+    _log(f"[db] Found {len(existing)} existing jobs in Supabase")
+
+    fresh: list[JobListing] = []
+    for job in jobs:
+        key = normalize_apply_url(job.apply_url)
+        if not key:
+            continue
+        if key in existing:
+            continue
+        if key != job.apply_url:
+            job = JobListing(
+                title=job.title,
+                company=job.company,
+                location=job.location,
+                salary_range=job.salary_range,
+                description=job.description,
+                apply_url=key,
+                category=job.category,
+            )
+        fresh.append(job)
+        existing.add(key)  # prevent intra-run duplicates across batches
+
     skipped = len(jobs) - len(fresh)
     if not fresh:
-        _log("[scraper] No new jobs to insert (all duplicates)")
-        return 0, skipped
+        _log("[db] No new jobs to write (all duplicates)")
+        return WriteResult(inserted=0, skipped=skipped, failed=0)
+
     rows = [to_row(j) for j in fresh]
     inserted = 0
+    failed = 0
     batch_size = 40
     for i in range(0, len(rows), batch_size):
         batch = rows[i : i + batch_size]
+        batch_num = i // batch_size + 1
         try:
-            db.table("jobs").insert(batch).execute()
+            # ignore_duplicates → ON CONFLICT DO NOTHING against any unique index
+            # (including jobs_apply_url_uidx on lower(apply_url)). Race-safe.
+            db.table("jobs").upsert(batch, ignore_duplicates=True).execute()
             inserted += len(batch)
-            _log(
-                f"[scraper] Successfully written batch {i // batch_size + 1} "
-                f"to database (+{len(batch)})"
-            )
+            _log(f"[db] Upserted batch {batch_num} (+{len(batch)})")
         except Exception as e:
-            print(f"Error scraping target: {e}", flush=True)
-    _log(f"[scraper] Successfully written {inserted} new jobs to database")
-    return inserted, skipped
+            failed += len(batch)
+            _log_err(
+                f"[db] Batch {batch_num} FAILED ({len(batch)} rows): "
+                f"{type(e).__name__}: {e}"
+            )
+
+    _log(
+        f"[db] Write complete — inserted/upserted={inserted} "
+        f"skipped={skipped} failed={failed}"
+    )
+    return WriteResult(inserted=inserted, skipped=skipped, failed=failed)
 
 
 def category_breakdown(jobs: list[JobListing]) -> dict[str, int]:
@@ -729,13 +857,32 @@ def category_breakdown(jobs: list[JobListing]) -> dict[str, int]:
     return counts
 
 
+def print_run_summary(stats: RunStats) -> None:
+    status = "OK" if stats.ok else "FAILED"
+    lines = [
+        "========== RUN SUMMARY ==========",
+        f"fetched:       {stats.fetched}",
+        f"deduplicated:  {stats.deduplicated}",
+        f"skipped:       {stats.skipped}",
+        f"inserted:      {stats.inserted}",
+        f"failed:        {stats.failed}",
+        f"status:        {status}",
+    ]
+    if stats.critical_error:
+        lines.append(f"error:         {stats.critical_error}")
+    lines.append("=================================")
+    print("\n".join(lines), flush=True)
+
+
 def main() -> int:
-    """Always return 0 so CI stays green on partial scrape / DB outages."""
-    inserted = 0
+    """
+    Fail closed: non-zero exit on credential failure, existing-key fetch failure,
+    insert/upsert failures, or other critical errors.
+    """
+    stats = RunStats()
     _log(f"[scraper] RemoteReady HQ scraper — {datetime.now(timezone.utc).isoformat()}")
     _log(f"[scraper] cwd={Path.cwd()} script={Path(__file__).resolve()}")
 
-    # Re-read credentials after CI exports; SECRET_KEY ⇒ attempt server-side writes
     url, anon, secret = refresh_supabase_credentials()
     print(
         f"[scraper] Supabase Client Initialized: URL={url}, "
@@ -743,73 +890,110 @@ def main() -> int:
         f"(secret_len={len(secret)})",
         flush=True,
     )
-    can_write = supabase_available()
-    if not can_write:
-        print(
-            "[scraper] WARNING: SUPABASE_SECRET_KEY / SUPABASE_SERVICE_ROLE_KEY missing "
-            "— will scrape but cannot write.",
-            flush=True,
-        )
-    else:
-        # Fail fast with a clear error if create_client cannot be constructed.
-        try:
-            get_supabase_admin()
-            _log("[scraper] create_client(supabase_url=…, supabase_key=…) OK")
-        except Exception as e:
-            print(f"Error scraping target: {e}", flush=True)
-            can_write = False
+
+    db: Client | None = None
+    try:
+        if not secret:
+            raise CredentialError(
+                "missing SUPABASE_SECRET_KEY (or SUPABASE_SERVICE_ROLE_KEY) — "
+                "cannot write to the database"
+            )
+        db = probe_supabase()
+        _log("[scraper] create_client + credential probe OK")
+    except Exception as e:
+        stats.critical_error = str(e)
+        _log_err(f"[scraper] Credential validation failed: {e}")
+        print_run_summary(stats)
+        return 1
 
     try:
         _log("[scraper] Starting scrape_all()…")
         try:
             scraped = scrape_all()
         except Exception as e:
-            print(f"Error scraping target: {e}", flush=True)
-            scraped = []
+            stats.critical_error = f"scrape_all failed: {e}"
+            _log_err(f"[scraper] {stats.critical_error}")
+            print_run_summary(stats)
+            return 1
 
+        stats.fetched = len(scraped)
         unique = deduplicate(scraped)
-        _log(f"[scraper] Scraped {len(scraped)} → {len(unique)} after dedupe.")
+        stats.deduplicated = len(unique)
+        _log(f"[scraper] Scraped {stats.fetched} → {stats.deduplicated} after dedupe.")
         _log(f"[scraper] Category mix: {category_breakdown(unique)}")
 
-        if unique and can_write:
-            priority = sorted(
-                unique,
-                key=lambda j: (
-                    0 if j.category in ("Support", "Sales") else 1,
-                    j.title,
-                ),
+        if not unique:
+            stats.critical_error = "no jobs scraped from any source this run"
+            _log_err(f"[scraper] {stats.critical_error}")
+            print_run_summary(stats)
+            return 1
+
+        priority = sorted(
+            unique,
+            key=lambda j: (
+                0 if j.category in ("Support", "Sales") else 1,
+                j.title,
+            ),
+        )
+        _log("[db] Upserting into Supabase…")
+        print(f"[scraper] Connecting to Supabase at: {SUPABASE_URL}", flush=True)
+        try:
+            result = insert_jobs(priority, client=db)
+        except ExistingKeysFetchError as e:
+            stats.critical_error = str(e)
+            _log_err(f"[db] {stats.critical_error}")
+            print_run_summary(stats)
+            return 1
+        except Exception as e:
+            stats.critical_error = f"database write failed: {e}"
+            _log_err(f"[db] {stats.critical_error}")
+            print_run_summary(stats)
+            return 1
+
+        stats.inserted = result.inserted
+        stats.skipped = result.skipped
+        stats.failed = result.failed
+        total = count_jobs(db)
+        _log(
+            f"[db] Inserted {result.inserted}; skipped {result.skipped}; "
+            f"failed {result.failed}. DB total={total}."
+        )
+
+        if result.failed > 0:
+            stats.critical_error = (
+                f"{result.failed} job row(s) failed during upsert"
             )
-            _log("[scraper] Inserting into Supabase…")
-            print(f"[scraper] Connecting to Supabase at: {SUPABASE_URL}", flush=True)
-            try:
-                inserted, skipped = insert_jobs(priority)
-                total = count_jobs()
-                _log(
-                    f"[scraper] Inserted {inserted}; skipped {skipped}. "
-                    f"DB total={total}."
-                )
-            except Exception as e:
-                print(f"Error scraping target: {e}", flush=True)
-        elif unique and not can_write:
-            _log(
-                f"[scraper] Scraped {len(scraped)} → {len(unique)} after dedupe "
-                "(not written — SUPABASE_SECRET_KEY missing)."
+            print_run_summary(stats)
+            return 1
+
+        # Fresh jobs existed after DB dedupe but nothing landed — treat as failure.
+        fresh_expected = stats.deduplicated - stats.skipped
+        if fresh_expected > 0 and stats.inserted == 0:
+            stats.critical_error = (
+                f"{fresh_expected} new job(s) expected but inserted=0"
             )
-        else:
-            _log("[scraper] No jobs scraped from any source this run.")
+            print_run_summary(stats)
+            return 1
 
     except Exception as e:
-        print(f"Error scraping target: {e}", flush=True)
-    finally:
-        print(f"Scrape completed. Inserted {inserted} new jobs.", flush=True)
+        stats.critical_error = f"critical error: {e}"
+        _log_err(f"[scraper] {stats.critical_error}")
+        print_run_summary(stats)
+        return 1
 
+    print_run_summary(stats)
+    print(f"Scrape completed. Inserted {stats.inserted} new jobs.", flush=True)
     return 0
 
 
 if __name__ == "__main__":
     try:
-        main()
+        raise SystemExit(main())
+    except SystemExit:
+        raise
     except Exception as e:
-        print(f"Error scraping target: {e}", flush=True)
-        print("Scrape completed. Inserted 0 new jobs.", flush=True)
-    sys.exit(0)
+        print(f"[scraper] Fatal: {e}", flush=True)
+        print_run_summary(
+            RunStats(critical_error=str(e), failed=0)
+        )
+        raise SystemExit(1) from e

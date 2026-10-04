@@ -14,8 +14,13 @@ create table if not exists public.jobs (
   created_at timestamptz not null default now()
 );
 
+-- Case-insensitive uniqueness (legacy + safety net)
 create unique index if not exists jobs_apply_url_uidx
   on public.jobs (lower(apply_url));
+
+-- Exact uniqueness for normalized apply_url values written by the scraper
+create unique index if not exists jobs_apply_url_exact_uidx
+  on public.jobs (apply_url);
 
 create table if not exists public.users (
   id uuid primary key default gen_random_uuid(),

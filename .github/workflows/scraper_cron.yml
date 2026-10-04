@@ -144,6 +144,7 @@ jobs:
           SCRAPER_SALES_MIN: ${{ vars.SCRAPER_SALES_MIN || '30' }}
           PYTHONUNBUFFERED: "1"
         run: |
+          set -euo pipefail
           DEFAULT_URL="https://ujhsltlhlnwuysikzvhs.supabase.co"
           echo "[scraper-ci] Starting scrape_jobs.py from $(pwd)"
           echo "[scraper-ci] SUPABASE_URL present: $([ -n "${SUPABASE_URL:-}" ] && echo yes || echo no)"
@@ -156,6 +157,11 @@ jobs:
           fi
           if [ -z "${SUPABASE_ANON_KEY:-}" ] && [ -n "${NEXT_PUBLIC_SUPABASE_ANON_KEY:-}" ]; then
             export SUPABASE_ANON_KEY="${NEXT_PUBLIC_SUPABASE_ANON_KEY}"
+          fi
+
+          if [ -z "${SUPABASE_SECRET_KEY:-}" ]; then
+            echo "::error::SUPABASE_SECRET_KEY (or SUPABASE_SERVICE_ROLE_KEY) is required"
+            exit 1
           fi
 
           URL="${SUPABASE_URL:-${NEXT_PUBLIC_SUPABASE_URL:-$DEFAULT_URL}}"
@@ -179,6 +185,8 @@ jobs:
           export SUPABASE_URL="$URL"
           export NEXT_PUBLIC_SUPABASE_URL="$URL"
           echo "[scraper-ci] Connecting to Supabase at: ${SUPABASE_URL}"
-          echo "[scraper-ci] Writes use supabase-py + SUPABASE_SECRET_KEY (not browser UA)"
+          echo "[scraper-ci] Writes use supabase-py + SUPABASE_SECRET_KEY (fail-closed)"
           python scrape_jobs.py
-          echo "[scraper-ci] scrape_jobs.py finished with exit code $?"
+          code=$?
+          echo "[scraper-ci] scrape_jobs.py finished with exit code ${code}"
+          exit "${code}"
