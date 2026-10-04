@@ -49,22 +49,28 @@ def _sanitize_url(raw: str | None) -> str:
     return value
 
 
+def _env_first(*names: str) -> str:
+    """First non-empty stripped env value among names."""
+    for name in names:
+        value = os.environ.get(name)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
 # URL + key resolution at import.
 # ANON_KEY: browser / Playwright / client-side only (never for privileged writes).
 # SECRET_KEY: server-side Python SDK inserts only (never send with a browser UA).
 SUPABASE_URL = _sanitize_url(
-    os.environ.get("SUPABASE_URL") or os.environ.get("NEXT_PUBLIC_SUPABASE_URL")
+    _env_first("SUPABASE_URL", "NEXT_PUBLIC_SUPABASE_URL") or None
 )
-ANON_KEY = (
-    os.environ.get("SUPABASE_ANON_KEY")
-    or os.environ.get("NEXT_PUBLIC_SUPABASE_ANON_KEY")
-    or ""
-).strip()
-SECRET_KEY = (os.environ.get("SUPABASE_SECRET_KEY") or "").strip()
+ANON_KEY = _env_first("SUPABASE_ANON_KEY", "NEXT_PUBLIC_SUPABASE_ANON_KEY")
+SECRET_KEY = _env_first("SUPABASE_SECRET_KEY", "SUPABASE_SERVICE_ROLE_KEY")
 
 print(
     f"[scraper] Supabase Client Initialized: URL={SUPABASE_URL}, "
-    f"Anon Present={bool(ANON_KEY)}, Secret Present={bool(SECRET_KEY)}",
+    f"Anon Present={bool(ANON_KEY)}, Secret Present={bool(SECRET_KEY)} "
+    f"(secret_len={len(SECRET_KEY)})",
     flush=True,
 )
 
@@ -284,14 +290,11 @@ def refresh_supabase_credentials() -> tuple[str, str, str]:
     """Re-read env so late-exported CI vars are picked up. Returns (url, anon, secret)."""
     global SUPABASE_URL, ANON_KEY, SECRET_KEY
     SUPABASE_URL = _sanitize_url(
-        os.environ.get("SUPABASE_URL") or os.environ.get("NEXT_PUBLIC_SUPABASE_URL")
+        _env_first("SUPABASE_URL", "NEXT_PUBLIC_SUPABASE_URL") or None
     )
-    ANON_KEY = (
-        os.environ.get("SUPABASE_ANON_KEY")
-        or os.environ.get("NEXT_PUBLIC_SUPABASE_ANON_KEY")
-        or ""
-    ).strip()
-    SECRET_KEY = (os.environ.get("SUPABASE_SECRET_KEY") or "").strip()
+    ANON_KEY = _env_first("SUPABASE_ANON_KEY", "NEXT_PUBLIC_SUPABASE_ANON_KEY")
+    # Prefer SUPABASE_SECRET_KEY; allow legacy service_role secret name in CI.
+    SECRET_KEY = _env_first("SUPABASE_SECRET_KEY", "SUPABASE_SERVICE_ROLE_KEY")
     return SUPABASE_URL, ANON_KEY, SECRET_KEY
 
 
@@ -301,21 +304,46 @@ def supabase_available() -> bool:
     return bool(url and secret)
 
 
+def _require_url_and_key(url: str, key: str, *, key_name: str) -> tuple[str, str]:
+    """Ensure create_client gets two real non-empty strings."""
+    url_s = (url or "").strip()
+    key_s = (key or "").strip()
+    if not url_s:
+        raise ValueError("SUPABASE_URL is empty — cannot create Supabase client")
+    if not key_s:
+        raise ValueError(
+            f"{key_name} is empty — cannot create Supabase client "
+            "(expected a non-empty string)"
+        )
+    if not isinstance(url_s, str) or not isinstance(key_s, str):
+        raise TypeError(
+            f"create_client requires str url/key, got {type(url_s)!r} / {type(key_s)!r}"
+        )
+    return url_s, key_s
+
+
 def get_supabase_admin() -> Client:
     """
     Server-side Supabase client for DB reads/writes.
     Uses SECRET_KEY only via supabase-py (httpx) — never Playwright / browser fetch.
     """
     url, _anon, secret = refresh_supabase_credentials()
-    print(f"[scraper] Connecting to Supabase at: {url} (supabase-py + SECRET_KEY)", flush=True)
+    url, secret = _require_url_and_key(
+        url, secret, key_name="SUPABASE_SECRET_KEY"
+    )
     print(
-        f"[scraper] Supabase Client Initialized: URL={url}, "
-        f"Anon Present={bool(_anon)}, Secret Present={bool(secret)}",
+        f"[scraper] Connecting to Supabase at: {url} "
+        f"(supabase-py create_client + SECRET_KEY, key_len={len(secret)})",
         flush=True,
     )
-    if not secret:
-        raise ValueError("missing required environment variable: SUPABASE_SECRET_KEY")
-    return create_client(url, secret)
+    print(
+        f"[scraper] Supabase Client Initialized: URL={url}, "
+        f"Anon Present={bool(_anon)}, Secret Present={True}",
+        flush=True,
+    )
+    # Keyword args avoid positional mistakes that raise:
+    # Client.__init__() missing 1 required positional argument: 'supabase_key'
+    return create_client(supabase_url=url, supabase_key=secret)
 
 
 def get_supabase_anon() -> Client | None:
@@ -327,7 +355,8 @@ def get_supabase_anon() -> Client | None:
     url, anon, _secret = refresh_supabase_credentials()
     if not anon:
         return None
-    return create_client(url, anon)
+    url, anon = _require_url_and_key(url, anon, key_name="SUPABASE_ANON_KEY")
+    return create_client(supabase_url=url, supabase_key=anon)
 
 
 def make_listing(
@@ -710,17 +739,25 @@ def main() -> int:
     url, anon, secret = refresh_supabase_credentials()
     print(
         f"[scraper] Supabase Client Initialized: URL={url}, "
-        f"Anon Present={bool(anon)}, Secret Present={bool(secret)}",
+        f"Anon Present={bool(anon)}, Secret Present={bool(secret)} "
+        f"(secret_len={len(secret)})",
         flush=True,
     )
-    # Ensure anon helper is wired (browser-safe path); never used for inserts.
-    _ = get_supabase_anon()
     can_write = supabase_available()
     if not can_write:
         print(
-            "[scraper] WARNING: SUPABASE_SECRET_KEY missing — will scrape but cannot write.",
+            "[scraper] WARNING: SUPABASE_SECRET_KEY / SUPABASE_SERVICE_ROLE_KEY missing "
+            "— will scrape but cannot write.",
             flush=True,
         )
+    else:
+        # Fail fast with a clear error if create_client cannot be constructed.
+        try:
+            get_supabase_admin()
+            _log("[scraper] create_client(supabase_url=…, supabase_key=…) OK")
+        except Exception as e:
+            print(f"Error scraping target: {e}", flush=True)
+            can_write = False
 
     try:
         _log("[scraper] Starting scrape_all()…")

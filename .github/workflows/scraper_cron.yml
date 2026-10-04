@@ -52,8 +52,9 @@ jobs:
           python -m pip install --upgrade pip
           echo "[scraper-ci] Installing scrapers/requirements.txt"
           pip install -r requirements.txt
-          pip install playwright beautifulsoup4 supabase python-dotenv requests lxml
-          python -c "import playwright, supabase, dotenv, bs4, requests; print('[scraper-ci] imports ok')"
+          # Do not reinstall unpinned `supabase` — that upgrades past requirements.txt
+          # and can break create_client(url, key) initialization.
+          python -c "import playwright, supabase, dotenv, bs4, requests; print('[scraper-ci] imports ok', 'supabase', getattr(supabase, '__version__', '?'))"
 
       - name: Install Playwright Chromium
         run: |
