@@ -28,9 +28,10 @@ jobs:
       NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
       SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-      SCRAPER_TARGET_MIN: ${{ vars.SCRAPER_TARGET_MIN }}
-      SCRAPER_SUPPORT_MIN: ${{ vars.SCRAPER_SUPPORT_MIN }}
-      SCRAPER_SALES_MIN: ${{ vars.SCRAPER_SALES_MIN }}
+      # Use defaults when repo vars are unset — empty strings break int() in Python
+      SCRAPER_TARGET_MIN: ${{ vars.SCRAPER_TARGET_MIN || '120' }}
+      SCRAPER_SUPPORT_MIN: ${{ vars.SCRAPER_SUPPORT_MIN || '30' }}
+      SCRAPER_SALES_MIN: ${{ vars.SCRAPER_SALES_MIN || '30' }}
       PYTHONUNBUFFERED: "1"
 
     steps:
@@ -48,15 +49,17 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          echo "[scraper-ci] Installing from scrapers/requirements.txt"
+          echo "[scraper-ci] Installing scrapers/requirements.txt"
           pip install -r requirements.txt
-          python -c "import playwright, supabase, dotenv; print('[scraper-ci] imports ok')"
+          # Explicit fallback packages (idempotent if already installed)
+          pip install playwright beautifulsoup4 supabase python-dotenv requests lxml
+          python -c "import playwright, supabase, dotenv, bs4, requests; print('[scraper-ci] imports ok')"
 
       - name: Install Playwright Chromium
         run: |
           set -euo pipefail
-          echo "[scraper-ci] Installing Playwright Chromium + system deps"
-          playwright install --with-deps chromium
+          echo "[scraper-ci] playwright install chromium --with-deps"
+          playwright install chromium --with-deps
           python -c "from playwright.sync_api import sync_playwright; print('[scraper-ci] playwright ready')"
 
       - name: Verify Supabase environment
@@ -64,12 +67,13 @@ jobs:
           set -euo pipefail
           URL="${SUPABASE_URL:-${NEXT_PUBLIC_SUPABASE_URL:-}}"
           KEY="${SUPABASE_SECRET_KEY:-${SUPABASE_SERVICE_ROLE_KEY:-}}"
+          echo "[scraper-ci] SUPABASE_URL set: $([ -n "${SUPABASE_URL:-}" ] && echo yes || echo no)"
+          echo "[scraper-ci] NEXT_PUBLIC_SUPABASE_URL set: $([ -n "${NEXT_PUBLIC_SUPABASE_URL:-}" ] && echo yes || echo no)"
+          echo "[scraper-ci] SUPABASE_SECRET_KEY set: $([ -n "${SUPABASE_SECRET_KEY:-}" ] && echo yes || echo no)"
+          echo "[scraper-ci] SUPABASE_SERVICE_ROLE_KEY set: $([ -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ] && echo yes || echo no)"
+          echo "[scraper-ci] SCRAPER_TARGET_MIN=${SCRAPER_TARGET_MIN}"
           if [ -z "$URL" ] || [ -z "$KEY" ]; then
-            echo "::error::Missing Supabase secrets. Set SUPABASE_URL (or NEXT_PUBLIC_SUPABASE_URL) and SUPABASE_SECRET_KEY (or SUPABASE_SERVICE_ROLE_KEY) in repo Actions secrets."
-            echo "[scraper-ci] SUPABASE_URL set: $([ -n "${SUPABASE_URL:-}" ] && echo yes || echo no)"
-            echo "[scraper-ci] NEXT_PUBLIC_SUPABASE_URL set: $([ -n "${NEXT_PUBLIC_SUPABASE_URL:-}" ] && echo yes || echo no)"
-            echo "[scraper-ci] SUPABASE_SECRET_KEY set: $([ -n "${SUPABASE_SECRET_KEY:-}" ] && echo yes || echo no)"
-            echo "[scraper-ci] SUPABASE_SERVICE_ROLE_KEY set: $([ -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ] && echo yes || echo no)"
+            echo "::error::Missing Supabase secrets. Set SUPABASE_URL (or NEXT_PUBLIC_SUPABASE_URL) and SUPABASE_SECRET_KEY (or SUPABASE_SERVICE_ROLE_KEY)."
             exit 1
           fi
           {
@@ -78,10 +82,11 @@ jobs:
             echo "SUPABASE_SECRET_KEY=${KEY}"
             echo "SUPABASE_SERVICE_ROLE_KEY=${KEY}"
           } >> "$GITHUB_ENV"
-          echo "[scraper-ci] Supabase credentials present (host will be logged by scrape_jobs.py)."
+          echo "[scraper-ci] Supabase credentials normalized for scrape_jobs.py"
 
       - name: Run scrapers
         run: |
           set -euo pipefail
           echo "[scraper-ci] Starting scrape_jobs.py from $(pwd)"
           python scrape_jobs.py
+          echo "[scraper-ci] scrape_jobs.py finished with exit code $?"
