@@ -736,11 +736,9 @@ def main() -> int:
                     )
                 except Exception as e:
                     print(f"Error scraping target: {e}", flush=True)
-                print(f"Scrape completed. Inserted {inserted} new jobs.", flush=True)
                 return 0
         except Exception as e:
             print(f"Error scraping target: {e}", flush=True)
-            print(f"Scrape completed. Inserted {inserted} new jobs.", flush=True)
             return 0
 
         _log("[scraper] Starting scrape_all()…")
