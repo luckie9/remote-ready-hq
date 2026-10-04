@@ -9,12 +9,9 @@ Stamps rrhq_category into description for accurate frontend pill counts.
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import re
 import sys
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,6 +20,7 @@ from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
+from supabase import Client, create_client
 
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
@@ -51,20 +49,22 @@ def _sanitize_url(raw: str | None) -> str:
     return value
 
 
-# Hardcoded resolution at import — env first, then safe default URL
+# URL + key resolution at import.
+# ANON_KEY: browser / Playwright / client-side only (never for privileged writes).
+# SECRET_KEY: server-side Python SDK inserts only (never send with a browser UA).
 SUPABASE_URL = _sanitize_url(
     os.environ.get("SUPABASE_URL") or os.environ.get("NEXT_PUBLIC_SUPABASE_URL")
 )
-SUPABASE_KEY = (
-    os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-    or os.environ.get("SUPABASE_SECRET_KEY")
-    or os.environ.get("SUPABASE_KEY")
+ANON_KEY = (
+    os.environ.get("SUPABASE_ANON_KEY")
+    or os.environ.get("NEXT_PUBLIC_SUPABASE_ANON_KEY")
     or ""
 ).strip()
+SECRET_KEY = (os.environ.get("SUPABASE_SECRET_KEY") or "").strip()
 
 print(
     f"[scraper] Supabase Client Initialized: URL={SUPABASE_URL}, "
-    f"Key Present={bool(SUPABASE_KEY)}",
+    f"Anon Present={bool(ANON_KEY)}, Secret Present={bool(SECRET_KEY)}",
     flush=True,
 )
 
@@ -280,84 +280,54 @@ BROWSER_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-def refresh_supabase_credentials() -> tuple[str, str]:
-    """Re-read env (and apply sanitization) so late-exported CI vars are picked up."""
-    global SUPABASE_URL, SUPABASE_KEY
+def refresh_supabase_credentials() -> tuple[str, str, str]:
+    """Re-read env so late-exported CI vars are picked up. Returns (url, anon, secret)."""
+    global SUPABASE_URL, ANON_KEY, SECRET_KEY
     SUPABASE_URL = _sanitize_url(
         os.environ.get("SUPABASE_URL") or os.environ.get("NEXT_PUBLIC_SUPABASE_URL")
     )
-    SUPABASE_KEY = (
-        os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-        or os.environ.get("SUPABASE_SECRET_KEY")
-        or os.environ.get("SUPABASE_KEY")
+    ANON_KEY = (
+        os.environ.get("SUPABASE_ANON_KEY")
+        or os.environ.get("NEXT_PUBLIC_SUPABASE_ANON_KEY")
         or ""
     ).strip()
-    return SUPABASE_URL, SUPABASE_KEY
+    SECRET_KEY = (os.environ.get("SUPABASE_SECRET_KEY") or "").strip()
+    return SUPABASE_URL, ANON_KEY, SECRET_KEY
 
 
 def supabase_available() -> bool:
-    """Credentials present ⇒ treat Supabase as available and attempt writes."""
-    url, key = refresh_supabase_credentials()
-    return bool(url and key)
+    """Secret key present ⇒ treat backend writes as available."""
+    url, _anon, secret = refresh_supabase_credentials()
+    return bool(url and secret)
 
 
-def require_supabase() -> tuple[str, str]:
-    """Return (url, key). Raises ValueError if service key is missing/blank."""
-    url, key = refresh_supabase_credentials()
-    print(f"[scraper] Connecting to Supabase at: {url}", flush=True)
+def get_supabase_admin() -> Client:
+    """
+    Server-side Supabase client for DB reads/writes.
+    Uses SECRET_KEY only via supabase-py (httpx) — never Playwright / browser fetch.
+    """
+    url, _anon, secret = refresh_supabase_credentials()
+    print(f"[scraper] Connecting to Supabase at: {url} (supabase-py + SECRET_KEY)", flush=True)
     print(
-        f"[scraper] Supabase Client Initialized: URL={url}, Key Present={bool(key)}",
+        f"[scraper] Supabase Client Initialized: URL={url}, "
+        f"Anon Present={bool(_anon)}, Secret Present={bool(secret)}",
         flush=True,
     )
-    if not key:
-        raise ValueError(
-            "missing required environment variables: "
-            "SUPABASE_SERVICE_ROLE_KEY or SUPABASE_SECRET_KEY or SUPABASE_KEY"
-        )
-    return url, key
+    if not secret:
+        raise ValueError("missing required environment variable: SUPABASE_SECRET_KEY")
+    return create_client(url, secret)
 
 
-def supabase_request(
-    method: str,
-    path: str,
-    *,
-    body: object | None = None,
-    prefer: str | None = None,
-) -> tuple[int, object]:
-    url, key = require_supabase()
-    target = f"{url}{path}"
-    print(f"[scraper] Connecting to Supabase at: {url} ({method} {path})", flush=True)
-    headers = {
-        "apikey": key,
-        "Authorization": f"Bearer {key}",
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "User-Agent": BROWSER_UA,
-    }
-    if prefer:
-        headers["Prefer"] = prefer
-    data = None if body is None else json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(target, data=data, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=90) as resp:
-            raw = resp.read().decode("utf-8")
-            return resp.status, json.loads(raw) if raw else None
-    except urllib.error.HTTPError as err:
-        raw = err.read().decode("utf-8", errors="replace")
-        print(
-            f"[scraper] supabase_request HTTPError {err.code} for {target}: {raw[:500]}",
-            flush=True,
-        )
-        raise RuntimeError(
-            f"Supabase {method} {path} → {err.code}: {raw[:400]}"
-        ) from err
-    except Exception as err:
-        print(
-            f"[scraper] supabase_request failed for {target}: "
-            f"{type(err).__name__}: {err!r}",
-            flush=True,
-        )
-        raise
+def get_supabase_anon() -> Client | None:
+    """
+    Publishable/anon client for any browser-safe reads.
+    Playwright job scraping does not call Supabase; this exists so anon is never
+    confused with SECRET_KEY if a client-side helper is added later.
+    """
+    url, anon, _secret = refresh_supabase_credentials()
+    if not anon:
+        return None
+    return create_client(url, anon)
 
 
 def make_listing(
@@ -623,16 +593,26 @@ def deduplicate(jobs: Iterable[JobListing]) -> list[JobListing]:
     return list(by_fp.values())
 
 
-def fetch_existing_keys() -> set[str]:
+def fetch_existing_keys(client: Client | None = None) -> set[str]:
+    """Load existing apply_url values via supabase-py (SECRET_KEY). No browser UA."""
     existing: set[str] = set()
     page_size = 1_000
     start = 0
+    try:
+        db = client or get_supabase_admin()
+    except Exception as e:
+        print(f"Error scraping target: {e}", flush=True)
+        return existing
     while True:
         try:
-            _, rows = supabase_request(
-                "GET",
-                f"/rest/v1/jobs?select=apply_url&offset={start}&limit={page_size}",
+            end = start + page_size - 1
+            resp = (
+                db.table("jobs")
+                .select("apply_url")
+                .range(start, end)
+                .execute()
             )
+            rows = resp.data or []
         except Exception as e:
             print(f"Error scraping target: {e}", flush=True)
             break
@@ -648,33 +628,14 @@ def fetch_existing_keys() -> set[str]:
     return existing
 
 
-def count_jobs() -> int:
+def count_jobs(client: Client | None = None) -> int:
+    """Count jobs via supabase-py (SECRET_KEY) — never browser User-Agent."""
     try:
-        url, key = require_supabase()
-    except Exception as e:
-        print(f"Error scraping target: {e}", flush=True)
-        return 0
-    req = urllib.request.Request(
-        f"{url}/rest/v1/jobs?select=id",
-        headers={
-            "apikey": key,
-            "Authorization": f"Bearer {key}",
-            "Prefer": "count=exact",
-            "Range": "0-0",
-            "User-Agent": BROWSER_UA,
-        },
-        method="GET",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            cr = resp.headers.get("content-range") or ""
-            if "/" in cr and cr.split("/")[-1].isdigit():
-                return int(cr.split("/")[-1])
-    except Exception as e:
-        print(f"Error scraping target: {e}", flush=True)
-    try:
-        _, rows = supabase_request("GET", "/rest/v1/jobs?select=id")
-        return len(rows) if isinstance(rows, list) else 0
+        db = client or get_supabase_admin()
+        resp = db.table("jobs").select("id", count="exact").limit(1).execute()
+        if resp.count is not None:
+            return int(resp.count)
+        return len(resp.data or [])
     except Exception as e:
         print(f"Error scraping target: {e}", flush=True)
         return 0
@@ -693,9 +654,18 @@ def to_row(job: JobListing) -> dict:
 
 
 def insert_jobs(jobs: list[JobListing]) -> tuple[int, int]:
+    """
+    Insert new jobs via supabase-py + SECRET_KEY only.
+    Completely detached from Playwright page.evaluate() / browser fetch.
+    """
     _log("[scraper] Loading existing apply_url keys from database…")
     try:
-        existing = fetch_existing_keys()
+        db = get_supabase_admin()
+    except Exception as e:
+        print(f"Error scraping target: {e}", flush=True)
+        return 0, len(jobs)
+    try:
+        existing = fetch_existing_keys(db)
     except Exception as e:
         print(f"Error scraping target: {e}", flush=True)
         existing = set()
@@ -711,9 +681,7 @@ def insert_jobs(jobs: list[JobListing]) -> tuple[int, int]:
     for i in range(0, len(rows), batch_size):
         batch = rows[i : i + batch_size]
         try:
-            supabase_request(
-                "POST", "/rest/v1/jobs", body=batch, prefer="return=minimal"
-            )
+            db.table("jobs").insert(batch).execute()
             inserted += len(batch)
             _log(
                 f"[scraper] Successfully written batch {i // batch_size + 1} "
@@ -738,16 +706,19 @@ def main() -> int:
     _log(f"[scraper] RemoteReady HQ scraper — {datetime.now(timezone.utc).isoformat()}")
     _log(f"[scraper] cwd={Path.cwd()} script={Path(__file__).resolve()}")
 
-    # Re-read credentials after CI exports; presence of URL+KEY ⇒ attempt writes
-    url, key = refresh_supabase_credentials()
+    # Re-read credentials after CI exports; SECRET_KEY ⇒ attempt server-side writes
+    url, anon, secret = refresh_supabase_credentials()
     print(
-        f"[scraper] Supabase Client Initialized: URL={url}, Key Present={bool(key)}",
+        f"[scraper] Supabase Client Initialized: URL={url}, "
+        f"Anon Present={bool(anon)}, Secret Present={bool(secret)}",
         flush=True,
     )
+    # Ensure anon helper is wired (browser-safe path); never used for inserts.
+    _ = get_supabase_anon()
     can_write = supabase_available()
     if not can_write:
         print(
-            "[scraper] WARNING: SUPABASE_KEY missing — will scrape but cannot write.",
+            "[scraper] WARNING: SUPABASE_SECRET_KEY missing — will scrape but cannot write.",
             flush=True,
         )
 
@@ -785,7 +756,7 @@ def main() -> int:
         elif unique and not can_write:
             _log(
                 f"[scraper] Scraped {len(scraped)} → {len(unique)} after dedupe "
-                "(not written — SUPABASE_KEY missing)."
+                "(not written — SUPABASE_SECRET_KEY missing)."
             )
         else:
             _log("[scraper] No jobs scraped from any source this run.")

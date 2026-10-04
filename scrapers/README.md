@@ -15,7 +15,8 @@ playwright install chromium
 Credentials are loaded from `scrapers/.env` or the project root `.env.local`:
 
 - `SUPABASE_URL` or `NEXT_PUBLIC_SUPABASE_URL`
-- `SUPABASE_SECRET_KEY` (preferred for inserts) or publishable key if RLS allows
+- `SUPABASE_SECRET_KEY` — server-side inserts via supabase-py (required for writes)
+- `SUPABASE_ANON_KEY` or `NEXT_PUBLIC_SUPABASE_ANON_KEY` — browser/client-safe only
 
 ## Run
 
