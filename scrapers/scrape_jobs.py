@@ -239,52 +239,69 @@ BROWSER_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
+# Safe project fallback when CI secret is empty / missing protocol
+DEFAULT_SUPABASE_URL = "https://ujhsltihinwuysikzvhs.supabase.co"
+
+
+def normalize_supabase_url(raw: str | None) -> str:
+    """Strip whitespace and force https:// before client init."""
+    value = (raw or "").strip().strip("'").strip('"')
+    if not value:
+        value = DEFAULT_SUPABASE_URL
+    # Missing or non-http(s) scheme → force https
+    if not re.match(r"^https?://", value, flags=re.I):
+        value = "https://" + value.lstrip("/")
+    # Prefer https even if http was provided
+    if value.lower().startswith("http://"):
+        value = "https://" + value[7:]
+    return value.rstrip("/")
+
 
 def require_supabase() -> tuple[str, str]:
-    """Return (url, key). Raises ValueError if required env vars are missing/blank."""
+    """Return (url, key). Raises ValueError if service key is missing/blank."""
     _log("[scraper] Connecting to Supabase…")
-    url = _env_str("SUPABASE_URL", "NEXT_PUBLIC_SUPABASE_URL").rstrip("/")
-    # Prefer service-role key, then secret key aliases
-    key = _env_str(
-        "SUPABASE_SERVICE_ROLE_KEY",
-        "SUPABASE_SECRET_KEY",
-        "SUPABASE_SERVICE_KEY",
+    raw_url = os.environ.get("SUPABASE_URL") or os.environ.get(
+        "NEXT_PUBLIC_SUPABASE_URL"
     )
+    url = normalize_supabase_url(raw_url)
+    # Prefer service-role key, then secret key aliases (never KeyError on missing)
+    key = (
+        os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+        or os.environ.get("SUPABASE_SECRET_KEY")
+        or os.environ.get("SUPABASE_SERVICE_KEY")
+        or ""
+    ).strip()
+
     host = ""
     try:
         host = urlparse(url).netloc if url else ""
     except Exception:
         host = ""
 
-    if url:
-        preview = url[:15] + ("..." if len(url) > 15 else "")
-        print(f"[scraper] Supabase URL detected: {preview}", flush=True)
-    else:
-        print("[scraper] Supabase URL detected: (missing)", flush=True)
+    preview = url[:15] + ("..." if len(url) > 15 else "")
+    print(f"[scraper] Supabase URL detected: {preview}", flush=True)
+    if not (raw_url or "").strip():
+        _log(f"[scraper] Using DEFAULT_SUPABASE_URL fallback ({host})")
 
     key_source = "none"
-    if _env_str("SUPABASE_SERVICE_ROLE_KEY"):
+    if (os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip():
         key_source = "SUPABASE_SERVICE_ROLE_KEY"
-    elif _env_str("SUPABASE_SECRET_KEY"):
+    elif (os.environ.get("SUPABASE_SECRET_KEY") or "").strip():
         key_source = "SUPABASE_SECRET_KEY"
-    elif _env_str("SUPABASE_SERVICE_KEY"):
+    elif (os.environ.get("SUPABASE_SERVICE_KEY") or "").strip():
         key_source = "SUPABASE_SERVICE_KEY"
 
     _log(
         "[scraper] env check: "
-        f"SUPABASE_URL={'yes' if url else 'NO'} host={host or '(none)'} "
+        f"SUPABASE_URL host={host or '(none)'} "
         f"key_source={key_source} key_len={len(key)} "
         f"TARGET_MIN={TARGET_MIN} SUPPORT_MIN={SUPPORT_MIN} SALES_MIN={SALES_MIN}"
     )
 
-    missing = []
-    if not url:
-        missing.append("SUPABASE_URL or NEXT_PUBLIC_SUPABASE_URL")
     if not key:
-        missing.append("SUPABASE_SERVICE_ROLE_KEY or SUPABASE_SECRET_KEY")
-    if missing:
         raise ValueError(
-            "missing required environment variables: " + ", ".join(missing)
+            "missing required environment variables: "
+            "SUPABASE_SERVICE_ROLE_KEY or SUPABASE_SECRET_KEY"
         )
     return url, key
 

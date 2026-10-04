@@ -69,20 +69,38 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
           set +e
+          DEFAULT_URL="https://ujhsltihinwuysikzvhs.supabase.co"
           URL="${SUPABASE_URL:-${NEXT_PUBLIC_SUPABASE_URL:-}}"
+          URL="$(echo "$URL" | xargs)"
           KEY="${SUPABASE_SERVICE_ROLE_KEY:-${SUPABASE_SECRET_KEY:-}}"
+          # Fallback when empty or missing protocol
+          if [ -z "$URL" ]; then
+            URL="$DEFAULT_URL"
+            echo "[scraper-ci] SUPABASE_URL empty — using default fallback"
+          elif ! echo "$URL" | grep -Eqi '^https?://'; then
+            URL="https://${URL#/}"
+            echo "[scraper-ci] SUPABASE_URL missing protocol — forced https://"
+          fi
+          if echo "$URL" | grep -Eqi '^http://'; then
+            URL="https://${URL#http://}"
+            echo "[scraper-ci] SUPABASE_URL upgraded http → https"
+          fi
           echo "[scraper-ci] SUPABASE_URL set: $([ -n "${SUPABASE_URL:-}" ] && echo yes || echo no)"
           echo "[scraper-ci] NEXT_PUBLIC_SUPABASE_URL set: $([ -n "${NEXT_PUBLIC_SUPABASE_URL:-}" ] && echo yes || echo no)"
           echo "[scraper-ci] SUPABASE_SERVICE_ROLE_KEY set: $([ -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ] && echo yes || echo no)"
           echo "[scraper-ci] SUPABASE_SECRET_KEY set: $([ -n "${SUPABASE_SECRET_KEY:-}" ] && echo yes || echo no)"
-          if [ -z "$URL" ] || [ -z "$KEY" ]; then
-            echo "::warning::Missing Supabase secrets — scrape will run but cannot write to DB."
-            echo "::warning::Ensure repo secrets SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_SECRET_KEY) are set."
+          echo "[scraper-ci] Effective SUPABASE_URL: ${URL}"
+          {
+            echo "SUPABASE_URL=${URL}"
+            echo "NEXT_PUBLIC_SUPABASE_URL=${URL}"
+          } >> "$GITHUB_ENV"
+          if [ -z "$KEY" ]; then
+            echo "::warning::Missing SUPABASE_SERVICE_ROLE_KEY / SUPABASE_SECRET_KEY — scrape cannot write to DB."
           else
             HOST="$(echo "$URL" | sed -E 's#https?://([^/]+).*#\1#')"
             echo "[scraper-ci] Supabase host: ${HOST}"
             if ! getent hosts "$HOST" >/dev/null 2>&1; then
-              echo "::warning::Supabase host does not resolve (DNS). Fix SUPABASE_URL typo in GitHub Secrets."
+              echo "::warning::Supabase host does not resolve (DNS). Verify the project ref in SUPABASE_URL."
             else
               echo "[scraper-ci] Supabase host resolves OK"
             fi
@@ -100,6 +118,7 @@ jobs:
           SCRAPER_SALES_MIN: ${{ vars.SCRAPER_SALES_MIN || '30' }}
           PYTHONUNBUFFERED: "1"
         run: |
+          DEFAULT_URL="https://ujhsltihinwuysikzvhs.supabase.co"
           echo "[scraper-ci] Starting scrape_jobs.py from $(pwd)"
           echo "[scraper-ci] SUPABASE_URL present: $([ -n "${SUPABASE_URL:-}" ] && echo yes || echo no)"
           echo "[scraper-ci] SUPABASE_SERVICE_ROLE_KEY present: $([ -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ] && echo yes || echo no)"
@@ -111,8 +130,23 @@ jobs:
           if [ -z "${SUPABASE_SERVICE_ROLE_KEY:-}" ] && [ -n "${SUPABASE_SECRET_KEY:-}" ]; then
             export SUPABASE_SERVICE_ROLE_KEY="${SUPABASE_SECRET_KEY}"
           fi
-          if [ -z "${SUPABASE_URL:-}" ] && [ -n "${NEXT_PUBLIC_SUPABASE_URL:-}" ]; then
-            export SUPABASE_URL="${NEXT_PUBLIC_SUPABASE_URL}"
+          # Apply URL fallback / https normalization (overrides empty or schemeless secrets)
+          URL="${SUPABASE_URL:-${NEXT_PUBLIC_SUPABASE_URL:-}}"
+          URL="$(echo "$URL" | xargs)"
+          if [ -z "$URL" ]; then
+            export SUPABASE_URL="$DEFAULT_URL"
+            echo "[scraper-ci] Using default SUPABASE_URL fallback"
+          elif ! echo "$URL" | grep -Eqi '^https?://'; then
+            export SUPABASE_URL="https://${URL#/}"
+            echo "[scraper-ci] Forced https:// on SUPABASE_URL"
+          else
+            if echo "$URL" | grep -Eqi '^http://'; then
+              export SUPABASE_URL="https://${URL#http://}"
+            else
+              export SUPABASE_URL="$URL"
+            fi
           fi
+          export NEXT_PUBLIC_SUPABASE_URL="${SUPABASE_URL}"
+          echo "[scraper-ci] Effective SUPABASE_URL=${SUPABASE_URL}"
           python scrape_jobs.py
           echo "[scraper-ci] scrape_jobs.py finished with exit code $?"
