@@ -24,11 +24,11 @@ jobs:
         working-directory: scrapers
 
     env:
+      # Job-level defaults (also remapped explicitly on the Run scrapers step)
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
       SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-      # Use defaults when repo vars are unset — empty strings break int() in Python
       SCRAPER_TARGET_MIN: ${{ vars.SCRAPER_TARGET_MIN || '120' }}
       SCRAPER_SUPPORT_MIN: ${{ vars.SCRAPER_SUPPORT_MIN || '30' }}
       SCRAPER_SALES_MIN: ${{ vars.SCRAPER_SALES_MIN || '30' }}
@@ -51,7 +51,6 @@ jobs:
           python -m pip install --upgrade pip
           echo "[scraper-ci] Installing scrapers/requirements.txt"
           pip install -r requirements.txt
-          # Explicit fallback packages (idempotent if already installed)
           pip install playwright beautifulsoup4 supabase python-dotenv requests lxml
           python -c "import playwright, supabase, dotenv, bs4, requests; print('[scraper-ci] imports ok')"
 
@@ -63,37 +62,57 @@ jobs:
           python -c "from playwright.sync_api import sync_playwright; print('[scraper-ci] playwright ready')"
 
       - name: Verify Supabase environment
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
           set +e
           URL="${SUPABASE_URL:-${NEXT_PUBLIC_SUPABASE_URL:-}}"
-          KEY="${SUPABASE_SECRET_KEY:-${SUPABASE_SERVICE_ROLE_KEY:-}}"
+          KEY="${SUPABASE_SERVICE_ROLE_KEY:-${SUPABASE_SECRET_KEY:-}}"
           echo "[scraper-ci] SUPABASE_URL set: $([ -n "${SUPABASE_URL:-}" ] && echo yes || echo no)"
           echo "[scraper-ci] NEXT_PUBLIC_SUPABASE_URL set: $([ -n "${NEXT_PUBLIC_SUPABASE_URL:-}" ] && echo yes || echo no)"
-          echo "[scraper-ci] SUPABASE_SECRET_KEY set: $([ -n "${SUPABASE_SECRET_KEY:-}" ] && echo yes || echo no)"
           echo "[scraper-ci] SUPABASE_SERVICE_ROLE_KEY set: $([ -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ] && echo yes || echo no)"
-          echo "[scraper-ci] SCRAPER_TARGET_MIN=${SCRAPER_TARGET_MIN}"
+          echo "[scraper-ci] SUPABASE_SECRET_KEY set: $([ -n "${SUPABASE_SECRET_KEY:-}" ] && echo yes || echo no)"
           if [ -z "$URL" ] || [ -z "$KEY" ]; then
             echo "::warning::Missing Supabase secrets — scrape will run but cannot write to DB."
+            echo "::warning::Ensure repo secrets SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_SECRET_KEY) are set."
           else
-            {
-              echo "SUPABASE_URL=${URL}"
-              echo "NEXT_PUBLIC_SUPABASE_URL=${URL}"
-              echo "SUPABASE_SECRET_KEY=${KEY}"
-              echo "SUPABASE_SERVICE_ROLE_KEY=${KEY}"
-            } >> "$GITHUB_ENV"
-            HOST="$(python -c 'import os,urllib.parse as u; print(u.urlparse(os.environ.get("URL","")).netloc)' 2>/dev/null || true)"
-            # shell host parse fallback
-            HOST="${HOST:-$(echo "$URL" | sed -E 's#https?://([^/]+).*#\1#')}"
+            HOST="$(echo "$URL" | sed -E 's#https?://([^/]+).*#\1#')"
             echo "[scraper-ci] Supabase host: ${HOST}"
             if ! getent hosts "$HOST" >/dev/null 2>&1; then
-              echo "::warning::Supabase host does not resolve (DNS). Check for typos in SUPABASE_URL (expected *.supabase.co project ref)."
+              echo "::warning::Supabase host does not resolve (DNS). Fix SUPABASE_URL typo in GitHub Secrets."
+            else
+              echo "[scraper-ci] Supabase host resolves OK"
             fi
-            echo "[scraper-ci] Supabase credentials normalized for scrape_jobs.py"
           fi
 
       - name: Run scrapers
+        env:
+          # Explicit secret mapping so scrape_jobs.py always receives credentials
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+          SCRAPER_TARGET_MIN: ${{ vars.SCRAPER_TARGET_MIN || '120' }}
+          SCRAPER_SUPPORT_MIN: ${{ vars.SCRAPER_SUPPORT_MIN || '30' }}
+          SCRAPER_SALES_MIN: ${{ vars.SCRAPER_SALES_MIN || '30' }}
+          PYTHONUNBUFFERED: "1"
         run: |
           echo "[scraper-ci] Starting scrape_jobs.py from $(pwd)"
-          # Script is hardened to always exit 0 on partial failures
+          echo "[scraper-ci] SUPABASE_URL present: $([ -n "${SUPABASE_URL:-}" ] && echo yes || echo no)"
+          echo "[scraper-ci] SUPABASE_SERVICE_ROLE_KEY present: $([ -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ] && echo yes || echo no)"
+          echo "[scraper-ci] SUPABASE_SECRET_KEY present: $([ -n "${SUPABASE_SECRET_KEY:-}" ] && echo yes || echo no)"
+          # Prefer service role key when only one is set
+          if [ -z "${SUPABASE_SECRET_KEY:-}" ] && [ -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ]; then
+            export SUPABASE_SECRET_KEY="${SUPABASE_SERVICE_ROLE_KEY}"
+          fi
+          if [ -z "${SUPABASE_SERVICE_ROLE_KEY:-}" ] && [ -n "${SUPABASE_SECRET_KEY:-}" ]; then
+            export SUPABASE_SERVICE_ROLE_KEY="${SUPABASE_SECRET_KEY}"
+          fi
+          if [ -z "${SUPABASE_URL:-}" ] && [ -n "${NEXT_PUBLIC_SUPABASE_URL:-}" ]; then
+            export SUPABASE_URL="${NEXT_PUBLIC_SUPABASE_URL}"
+          fi
           python scrape_jobs.py
           echo "[scraper-ci] scrape_jobs.py finished with exit code $?"

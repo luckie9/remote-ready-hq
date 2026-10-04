@@ -244,10 +244,11 @@ def require_supabase() -> tuple[str, str]:
     """Return (url, key). Raises ValueError if required env vars are missing/blank."""
     _log("[scraper] Connecting to Supabase…")
     url = _env_str("SUPABASE_URL", "NEXT_PUBLIC_SUPABASE_URL").rstrip("/")
+    # Prefer service-role key, then secret key aliases
     key = _env_str(
-        "SUPABASE_SECRET_KEY",
         "SUPABASE_SERVICE_ROLE_KEY",
-        "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY",
+        "SUPABASE_SECRET_KEY",
+        "SUPABASE_SERVICE_KEY",
     )
     host = ""
     try:
@@ -255,10 +256,24 @@ def require_supabase() -> tuple[str, str]:
     except Exception:
         host = ""
 
+    if url:
+        preview = url[:15] + ("..." if len(url) > 15 else "")
+        print(f"[scraper] Supabase URL detected: {preview}", flush=True)
+    else:
+        print("[scraper] Supabase URL detected: (missing)", flush=True)
+
+    key_source = "none"
+    if _env_str("SUPABASE_SERVICE_ROLE_KEY"):
+        key_source = "SUPABASE_SERVICE_ROLE_KEY"
+    elif _env_str("SUPABASE_SECRET_KEY"):
+        key_source = "SUPABASE_SECRET_KEY"
+    elif _env_str("SUPABASE_SERVICE_KEY"):
+        key_source = "SUPABASE_SERVICE_KEY"
+
     _log(
         "[scraper] env check: "
         f"SUPABASE_URL={'yes' if url else 'NO'} host={host or '(none)'} "
-        f"SUPABASE_KEY={'yes' if key else 'NO'} key_len={len(key)} "
+        f"key_source={key_source} key_len={len(key)} "
         f"TARGET_MIN={TARGET_MIN} SUPPORT_MIN={SUPPORT_MIN} SALES_MIN={SALES_MIN}"
     )
 
@@ -266,7 +281,7 @@ def require_supabase() -> tuple[str, str]:
     if not url:
         missing.append("SUPABASE_URL or NEXT_PUBLIC_SUPABASE_URL")
     if not key:
-        missing.append("SUPABASE_SECRET_KEY or SUPABASE_SERVICE_ROLE_KEY")
+        missing.append("SUPABASE_SERVICE_ROLE_KEY or SUPABASE_SECRET_KEY")
     if missing:
         raise ValueError(
             "missing required environment variables: " + ", ".join(missing)
