@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import hashlib
 import os
+import random
 import re
 import sys
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
@@ -26,26 +28,37 @@ ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
 load_dotenv(ROOT.parent / ".env.local")
 
-# Live project host that resolves in DNS (typo refs like ujhsltihinwuysikzvhs do not).
-_DEFAULT_SUPABASE_URL = "https://ujhsltlhlnwuysikzvhs.supabase.co"
+# Known typo hosts from older secrets → explicit correction (never used as empty-URL fallback).
+_TYPO_HOST_REWRITES = {
+    "ujhsltihinwuysikzvhs.supabase.co": "https://ujhsltlhlnwuysikzvhs.supabase.co",
+    "ujhsltlhinwuysikzvhs.supabase.co": "https://ujhsltlhlnwuysikzvhs.supabase.co",
+}
+
+# HTTP statuses that warrant exponential backoff retries while scraping.
+_RETRYABLE_HTTP = frozenset({429, 503})
+_FETCH_MAX_RETRIES = 3
+_FETCH_BASE_DELAY_SEC = 1.5
 
 
 def _sanitize_url(raw: str | None) -> str:
+    """Normalize a Supabase URL. Returns '' if missing — never invents a project host."""
     value = (raw or "").strip().strip("'").strip('"')
     if not value:
-        return _DEFAULT_SUPABASE_URL
+        return ""
     if not re.match(r"^https?://", value, flags=re.I):
         value = "https://" + value.lstrip("/")
     if value.lower().startswith("http://"):
         value = "https://" + value[7:]
     value = value.rstrip("/")
     host = urlparse(value).netloc.lower()
-    # Rewrite known non-resolving typo hosts from CI secrets / older hardcodes
-    if host in {
-        "ujhsltihinwuysikzvhs.supabase.co",
-        "ujhsltlhinwuysikzvhs.supabase.co",
-    }:
-        return _DEFAULT_SUPABASE_URL
+    if host in _TYPO_HOST_REWRITES:
+        corrected = _TYPO_HOST_REWRITES[host].rstrip("/")
+        print(
+            f"[scraper] WARNING: typo Supabase host {host!r} — "
+            f"rewriting to {corrected} (fix the SUPABASE_URL secret)",
+            flush=True,
+        )
+        return corrected
     return value
 
 
@@ -58,19 +71,16 @@ def _env_first(*names: str) -> str:
     return ""
 
 
-# URL + key resolution at import.
-# ANON_KEY: browser / Playwright / client-side only (never for privileged writes).
+# URL + key resolution at import (empty until env/secrets are present).
 # SECRET_KEY: server-side Python SDK inserts only (never send with a browser UA).
 SUPABASE_URL = _sanitize_url(
     _env_first("SUPABASE_URL", "NEXT_PUBLIC_SUPABASE_URL") or None
 )
-ANON_KEY = _env_first("SUPABASE_ANON_KEY", "NEXT_PUBLIC_SUPABASE_ANON_KEY")
 SECRET_KEY = _env_first("SUPABASE_SECRET_KEY", "SUPABASE_SERVICE_ROLE_KEY")
 
 print(
-    f"[scraper] Supabase Client Initialized: URL={SUPABASE_URL}, "
-    f"Anon Present={bool(ANON_KEY)}, Secret Present={bool(SECRET_KEY)} "
-    f"(secret_len={len(SECRET_KEY)})",
+    f"[scraper] Supabase Client Initialized: URL={SUPABASE_URL or '(missing)'}, "
+    f"Secret Present={bool(SECRET_KEY)} (secret_len={len(SECRET_KEY)})",
     flush=True,
 )
 
@@ -84,15 +94,6 @@ def _log_err(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
-def _env_str(*names: str, default: str = "") -> str:
-    """First non-empty env var among names (GitHub Actions often sets unset vars to '')."""
-    for name in names:
-        value = os.environ.get(name)
-        if value is not None and str(value).strip():
-            return str(value).strip()
-    return default
-
-
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None or not str(raw).strip():
@@ -104,7 +105,7 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-# Re-read from os.environ at runtime (handles empty CI vars safely)
+# Volume floors — enforced after dedupe (fail the run if below threshold).
 TARGET_MIN = _env_int("SCRAPER_TARGET_MIN", 120)
 SUPPORT_MIN = _env_int("SCRAPER_SUPPORT_MIN", 30)
 SALES_MIN = _env_int("SCRAPER_SALES_MIN", 30)
@@ -201,11 +202,18 @@ class RunStats:
     skipped: int = 0
     inserted: int = 0
     failed: int = 0
+    support_count: int = 0
+    sales_count: int = 0
+    volume_warnings: list[str] = field(default_factory=list)
     critical_error: str | None = None
 
     @property
     def ok(self) -> bool:
-        return self.critical_error is None and self.failed == 0
+        return (
+            self.critical_error is None
+            and self.failed == 0
+            and not self.volume_warnings
+        )
 
 
 @dataclass
@@ -221,6 +229,10 @@ class ExistingKeysFetchError(RuntimeError):
 
 class CredentialError(RuntimeError):
     """Raised when Supabase URL/secret are missing or fail a connectivity probe."""
+
+
+class VolumeFloorError(RuntimeError):
+    """Raised when deduped scrape volume falls below configured floors."""
 
 
 def normalize_whitespace(text: str | None) -> str:
@@ -366,22 +378,15 @@ BROWSER_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-def refresh_supabase_credentials() -> tuple[str, str, str]:
-    """Re-read env so late-exported CI vars are picked up. Returns (url, anon, secret)."""
-    global SUPABASE_URL, ANON_KEY, SECRET_KEY
+def refresh_supabase_credentials() -> tuple[str, str]:
+    """Re-read env so late-exported CI vars are picked up. Returns (url, secret)."""
+    global SUPABASE_URL, SECRET_KEY
     SUPABASE_URL = _sanitize_url(
         _env_first("SUPABASE_URL", "NEXT_PUBLIC_SUPABASE_URL") or None
     )
-    ANON_KEY = _env_first("SUPABASE_ANON_KEY", "NEXT_PUBLIC_SUPABASE_ANON_KEY")
     # Prefer SUPABASE_SECRET_KEY; allow legacy service_role secret name in CI.
     SECRET_KEY = _env_first("SUPABASE_SECRET_KEY", "SUPABASE_SERVICE_ROLE_KEY")
-    return SUPABASE_URL, ANON_KEY, SECRET_KEY
-
-
-def supabase_available() -> bool:
-    """Secret key present ⇒ treat backend writes as available."""
-    url, _anon, secret = refresh_supabase_credentials()
-    return bool(url and secret)
+    return SUPABASE_URL, SECRET_KEY
 
 
 def _require_url_and_key(url: str, key: str, *, key_name: str) -> tuple[str, str]:
@@ -389,7 +394,9 @@ def _require_url_and_key(url: str, key: str, *, key_name: str) -> tuple[str, str
     url_s = (url or "").strip()
     key_s = (key or "").strip()
     if not url_s:
-        raise ValueError("SUPABASE_URL is empty — cannot create Supabase client")
+        raise ValueError(
+            "SUPABASE_URL is empty — set SUPABASE_URL or NEXT_PUBLIC_SUPABASE_URL"
+        )
     if not key_s:
         raise ValueError(
             f"{key_name} is empty — cannot create Supabase client "
@@ -407,7 +414,7 @@ def get_supabase_admin() -> Client:
     Server-side Supabase client for DB reads/writes.
     Uses SECRET_KEY only via supabase-py (httpx) — never Playwright / browser fetch.
     """
-    url, _anon, secret = refresh_supabase_credentials()
+    url, secret = refresh_supabase_credentials()
     url, secret = _require_url_and_key(
         url, secret, key_name="SUPABASE_SECRET_KEY"
     )
@@ -417,26 +424,12 @@ def get_supabase_admin() -> Client:
         flush=True,
     )
     print(
-        f"[scraper] Supabase Client Initialized: URL={url}, "
-        f"Anon Present={bool(_anon)}, Secret Present={True}",
+        f"[scraper] Supabase Client Initialized: URL={url}, Secret Present={True}",
         flush=True,
     )
     # Keyword args avoid positional mistakes that raise:
     # Client.__init__() missing 1 required positional argument: 'supabase_key'
     return create_client(supabase_url=url, supabase_key=secret)
-
-
-def get_supabase_anon() -> Client | None:
-    """
-    Publishable/anon client for any browser-safe reads.
-    Playwright job scraping does not call Supabase; this exists so anon is never
-    confused with SECRET_KEY if a client-side helper is added later.
-    """
-    url, anon, _secret = refresh_supabase_credentials()
-    if not anon:
-        return None
-    url, anon = _require_url_and_key(url, anon, key_name="SUPABASE_ANON_KEY")
-    return create_client(supabase_url=url, supabase_key=anon)
 
 
 def probe_supabase(client: Client | None = None) -> Client:
@@ -585,31 +578,110 @@ def parse_arbeitnow(rows: list) -> list[JobListing]:
     return out
 
 
+def _retry_delay_seconds(attempt: int, retry_after: str | None = None) -> float:
+    """Exponential backoff with jitter; honor Retry-After when present."""
+    delay = _FETCH_BASE_DELAY_SEC * (2**attempt) + random.uniform(0, 0.5)
+    if retry_after:
+        raw = retry_after.strip()
+        if raw.isdigit():
+            delay = max(delay, float(raw))
+    return delay
+
+
 def _fetch_source(
     context,
     label: str,
     url: str,
     parser,
 ) -> list[JobListing]:
-    """Fetch one source; log and continue on network/parse failures."""
-    try:
-        _log(f"[scraper] Fetching target URL: {url}")
-        res = context.request.get(
-            url,
-            timeout=60_000,
-            headers=BROWSER_HEADERS,
-        )
-        if not res.ok:
-            print(f"Error scraping target: HTTP {res.status} from {label}", flush=True)
-            return []
-        payload = res.json()
-        parsed = parser(payload)
-        _log(f"[scraper] Scraped {len(parsed)} jobs from {label}")
-        return parsed
-    except Exception as e:
-        print(f"Error scraping target: {e}", flush=True)
-        return []
+    """Fetch one source with retries on 429/503; soft-fail other errors."""
+    _log(f"[scraper] Fetching target URL: {url}")
+    last_error = ""
+    for attempt in range(_FETCH_MAX_RETRIES + 1):
+        try:
+            res = context.request.get(
+                url,
+                timeout=60_000,
+                headers=BROWSER_HEADERS,
+            )
+            status = res.status
+            if status in _RETRYABLE_HTTP:
+                last_error = f"HTTP {status} from {label}"
+                if attempt < _FETCH_MAX_RETRIES:
+                    # Playwright headers may be a dict-like object
+                    headers = getattr(res, "headers", {}) or {}
+                    retry_after = None
+                    try:
+                        retry_after = headers.get("retry-after") or headers.get(
+                            "Retry-After"
+                        )
+                    except Exception:
+                        retry_after = None
+                    delay = _retry_delay_seconds(attempt, retry_after)
+                    _log(
+                        f"[scraper] {label} {last_error}; "
+                        f"retry in {delay:.1f}s "
+                        f"(attempt {attempt + 1}/{_FETCH_MAX_RETRIES})"
+                    )
+                    time.sleep(delay)
+                    continue
+                print(
+                    f"Error scraping target: {last_error} "
+                    f"(retries exhausted)",
+                    flush=True,
+                )
+                return []
 
+            if not res.ok:
+                print(
+                    f"Error scraping target: HTTP {status} from {label}",
+                    flush=True,
+                )
+                return []
+
+            payload = res.json()
+            parsed = parser(payload)
+            if attempt > 0:
+                _log(
+                    f"[scraper] Scraped {len(parsed)} jobs from {label} "
+                    f"(succeeded after {attempt} retr{'y' if attempt == 1 else 'ies'})"
+                )
+            else:
+                _log(f"[scraper] Scraped {len(parsed)} jobs from {label}")
+            return parsed
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {e}"
+            if attempt < _FETCH_MAX_RETRIES:
+                delay = _retry_delay_seconds(attempt)
+                _log(
+                    f"[scraper] {label} request error ({last_error}); "
+                    f"retry in {delay:.1f}s "
+                    f"(attempt {attempt + 1}/{_FETCH_MAX_RETRIES})"
+                )
+                time.sleep(delay)
+                continue
+            print(f"Error scraping target: {last_error}", flush=True)
+            return []
+    return []
+
+
+def check_volume_floors(jobs: list[JobListing]) -> list[str]:
+    """
+    Compare deduped volume against SCRAPER_*_MIN floors.
+    Returns human-readable violation messages (empty ⇒ floors met).
+    """
+    breakdown = category_breakdown(jobs)
+    support = breakdown.get("Support", 0)
+    sales = breakdown.get("Sales", 0)
+    total = len(jobs)
+    issues: list[str] = []
+    if total < TARGET_MIN:
+        issues.append(f"total={total} < SCRAPER_TARGET_MIN={TARGET_MIN}")
+    if support < SUPPORT_MIN:
+        issues.append(f"Support={support} < SCRAPER_SUPPORT_MIN={SUPPORT_MIN}")
+    if sales < SALES_MIN:
+        issues.append(f"Sales={sales} < SCRAPER_SALES_MIN={SALES_MIN}")
+    return issues
 
 def scrape_all() -> list[JobListing]:
     all_jobs: list[JobListing] = []
@@ -866,8 +938,14 @@ def print_run_summary(stats: RunStats) -> None:
         f"skipped:       {stats.skipped}",
         f"inserted:      {stats.inserted}",
         f"failed:        {stats.failed}",
+        f"support:       {stats.support_count} (min {SUPPORT_MIN})",
+        f"sales:         {stats.sales_count} (min {SALES_MIN})",
+        f"target_min:    {TARGET_MIN}",
         f"status:        {status}",
     ]
+    if stats.volume_warnings:
+        for w in stats.volume_warnings:
+            lines.append(f"volume:        {w}")
     if stats.critical_error:
         lines.append(f"error:         {stats.critical_error}")
     lines.append("=================================")
@@ -877,22 +955,30 @@ def print_run_summary(stats: RunStats) -> None:
 def main() -> int:
     """
     Fail closed: non-zero exit on credential failure, existing-key fetch failure,
-    insert/upsert failures, or other critical errors.
+    insert/upsert failures, volume floor misses, or other critical errors.
     """
     stats = RunStats()
     _log(f"[scraper] RemoteReady HQ scraper — {datetime.now(timezone.utc).isoformat()}")
     _log(f"[scraper] cwd={Path.cwd()} script={Path(__file__).resolve()}")
+    _log(
+        f"[scraper] Volume floors: TARGET_MIN={TARGET_MIN} "
+        f"SUPPORT_MIN={SUPPORT_MIN} SALES_MIN={SALES_MIN}"
+    )
 
-    url, anon, secret = refresh_supabase_credentials()
+    url, secret = refresh_supabase_credentials()
     print(
-        f"[scraper] Supabase Client Initialized: URL={url}, "
-        f"Anon Present={bool(anon)}, Secret Present={bool(secret)} "
-        f"(secret_len={len(secret)})",
+        f"[scraper] Supabase Client Initialized: URL={url or '(missing)'}, "
+        f"Secret Present={bool(secret)} (secret_len={len(secret)})",
         flush=True,
     )
 
     db: Client | None = None
     try:
+        if not url:
+            raise CredentialError(
+                "missing SUPABASE_URL (or NEXT_PUBLIC_SUPABASE_URL) — "
+                "required; no hardcoded project fallback"
+            )
         if not secret:
             raise CredentialError(
                 "missing SUPABASE_SECRET_KEY (or SUPABASE_SERVICE_ROLE_KEY) — "
@@ -919,14 +1005,26 @@ def main() -> int:
         stats.fetched = len(scraped)
         unique = deduplicate(scraped)
         stats.deduplicated = len(unique)
+        breakdown = category_breakdown(unique)
+        stats.support_count = breakdown.get("Support", 0)
+        stats.sales_count = breakdown.get("Sales", 0)
         _log(f"[scraper] Scraped {stats.fetched} → {stats.deduplicated} after dedupe.")
-        _log(f"[scraper] Category mix: {category_breakdown(unique)}")
+        _log(f"[scraper] Category mix: {breakdown}")
 
         if not unique:
             stats.critical_error = "no jobs scraped from any source this run"
             _log_err(f"[scraper] {stats.critical_error}")
             print_run_summary(stats)
             return 1
+
+        # Volume floors: warn loudly; fail the run after writes so data is not discarded.
+        floor_issues = check_volume_floors(unique)
+        if floor_issues:
+            stats.volume_warnings = floor_issues
+            for issue in floor_issues:
+                # GitHub Actions annotation + scraper log
+                print(f"::warning::Volume floor missed — {issue}", flush=True)
+                _log_err(f"[scraper] VOLUME WARNING: {issue}")
 
         priority = sorted(
             unique,
@@ -971,6 +1069,13 @@ def main() -> int:
         if fresh_expected > 0 and stats.inserted == 0:
             stats.critical_error = (
                 f"{fresh_expected} new job(s) expected but inserted=0"
+            )
+            print_run_summary(stats)
+            return 1
+
+        if floor_issues:
+            stats.critical_error = (
+                "volume floor(s) not met: " + "; ".join(floor_issues)
             )
             print_run_summary(stats)
             return 1

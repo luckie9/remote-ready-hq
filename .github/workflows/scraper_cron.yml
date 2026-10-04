@@ -26,8 +26,6 @@ jobs:
     env:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
-      SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
-      NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
       SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
       SCRAPER_TARGET_MIN: ${{ vars.SCRAPER_TARGET_MIN || '120' }}
@@ -52,9 +50,7 @@ jobs:
           python -m pip install --upgrade pip
           echo "[scraper-ci] Installing scrapers/requirements.txt"
           pip install -r requirements.txt
-          # Do not reinstall unpinned `supabase` — that upgrades past requirements.txt
-          # and can break create_client(url, key) initialization.
-          python -c "import playwright, supabase, dotenv, bs4, requests; print('[scraper-ci] imports ok', 'supabase', getattr(supabase, '__version__', '?'))"
+          python -c "import playwright, supabase, dotenv; print('[scraper-ci] imports ok', 'supabase', getattr(supabase, '__version__', '?'))"
 
       - name: Install Playwright Chromium
         run: |
@@ -67,27 +63,29 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
-          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
-          NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
-          set +e
-          # Live project host (DNS-resolvable). Typo refs are rewritten below.
-          DEFAULT_URL="https://ujhsltlhlnwuysikzvhs.supabase.co"
-          URL="${SUPABASE_URL:-${NEXT_PUBLIC_SUPABASE_URL:-}}"
-          URL="$(echo "$URL" | sed -e 's/^[[:space:]\"'\'']*//' -e 's/[[:space:]\"'\'']*$//')"
-          # Prefer SUPABASE_SECRET_KEY for server writes; map legacy service_role if needed.
+          set -euo pipefail
+
           if [ -z "${SUPABASE_SECRET_KEY:-}" ] && [ -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ]; then
             export SUPABASE_SECRET_KEY="${SUPABASE_SERVICE_ROLE_KEY}"
           fi
+
+          URL="${SUPABASE_URL:-${NEXT_PUBLIC_SUPABASE_URL:-}}"
+          URL="$(echo "$URL" | sed -e 's/^[[:space:]\"'\'']*//' -e 's/[[:space:]\"'\'']*$//')"
           KEY="${SUPABASE_SECRET_KEY:-}"
-          ANON="${SUPABASE_ANON_KEY:-${NEXT_PUBLIC_SUPABASE_ANON_KEY:-}}"
 
           if [ -z "$URL" ]; then
-            URL="$DEFAULT_URL"
-            echo "[scraper-ci] SUPABASE_URL empty — using default fallback"
-          elif ! echo "$URL" | grep -Eqi '^https?://'; then
+            echo "::error::SUPABASE_URL (or NEXT_PUBLIC_SUPABASE_URL) secret is required — no hardcoded fallback"
+            exit 1
+          fi
+          if [ -z "$KEY" ]; then
+            echo "::error::SUPABASE_SECRET_KEY (or SUPABASE_SERVICE_ROLE_KEY) secret is required"
+            exit 1
+          fi
+
+          if ! echo "$URL" | grep -Eqi '^https?://'; then
             URL="https://${URL#/}"
             echo "[scraper-ci] SUPABASE_URL missing protocol — forced https://"
           fi
@@ -99,44 +97,34 @@ jobs:
 
           HOST="$(echo "$URL" | sed -E 's#https?://([^/]+).*#\1#')"
           case "$HOST" in
-            ujhsltihinwuysikzvhs.supabase.co|ujhsltlhinwuysikzvhs.supabase.co)
-              echo "[scraper-ci] Known typo host ${HOST} — rewriting to default"
-              URL="$DEFAULT_URL"
-              HOST="$(echo "$URL" | sed -E 's#https?://([^/]+).*#\1#')"
+            ujhsltihinwuysikzvhs.supabase.co)
+              URL="https://ujhsltlhlnwuysikzvhs.supabase.co"
+              echo "::warning::Typo host ${HOST} — rewriting to ${URL} (update the SUPABASE_URL secret)"
+              HOST="ujhsltlhlnwuysikzvhs.supabase.co"
+              ;;
+            ujhsltlhinwuysikzvhs.supabase.co)
+              URL="https://ujhsltlhlnwuysikzvhs.supabase.co"
+              echo "::warning::Typo host ${HOST} — rewriting to ${URL} (update the SUPABASE_URL secret)"
+              HOST="ujhsltlhlnwuysikzvhs.supabase.co"
               ;;
           esac
 
           if ! getent hosts "$HOST" >/dev/null 2>&1; then
-            echo "::warning::Supabase host ${HOST} does not resolve (DNS) — using default fallback"
-            URL="$DEFAULT_URL"
-            HOST="$(echo "$URL" | sed -E 's#https?://([^/]+).*#\1#')"
+            echo "::error::Supabase host ${HOST} does not resolve (DNS). Fix SUPABASE_URL — no silent fallback."
+            exit 1
           fi
 
-          echo "[scraper-ci] SUPABASE_SECRET_KEY set: $([ -n "${KEY}" ] && echo yes || echo no)"
-          echo "[scraper-ci] SUPABASE_ANON_KEY set: $([ -n "${ANON}" ] && echo yes || echo no)"
+          echo "[scraper-ci] SUPABASE_SECRET_KEY set: yes"
           echo "[scraper-ci] Effective SUPABASE_URL: ${URL}"
-          echo "[scraper-ci] Supabase host: ${HOST}"
-          if getent hosts "$HOST" >/dev/null 2>&1; then
-            echo "[scraper-ci] Supabase host resolves OK"
-          else
-            echo "::error::Default Supabase host also failed DNS — check runner network"
-          fi
+          echo "[scraper-ci] Supabase host resolves OK: ${HOST}"
 
           {
             echo "SUPABASE_URL=${URL}"
             echo "NEXT_PUBLIC_SUPABASE_URL=${URL}"
           } >> "$GITHUB_ENV"
 
-          if [ -z "$KEY" ]; then
-            echo "::warning::Missing SUPABASE_SECRET_KEY — scrape cannot write to DB."
-          fi
-
       - name: Run scrapers
         env:
-          # Prefer GITHUB_ENV URL/keys from verify step.
-          # Do NOT re-inject secrets.SUPABASE_URL here — it may contain a typo host.
-          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
-          NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           SCRAPER_TARGET_MIN: ${{ vars.SCRAPER_TARGET_MIN || '120' }}
@@ -145,47 +133,23 @@ jobs:
           PYTHONUNBUFFERED: "1"
         run: |
           set -euo pipefail
-          DEFAULT_URL="https://ujhsltlhlnwuysikzvhs.supabase.co"
           echo "[scraper-ci] Starting scrape_jobs.py from $(pwd)"
-          echo "[scraper-ci] SUPABASE_URL present: $([ -n "${SUPABASE_URL:-}" ] && echo yes || echo no)"
-          echo "[scraper-ci] SUPABASE_SECRET_KEY present: $([ -n "${SUPABASE_SECRET_KEY:-}" ] && echo yes || echo no)"
-          echo "[scraper-ci] SUPABASE_ANON_KEY present: $([ -n "${SUPABASE_ANON_KEY:-${NEXT_PUBLIC_SUPABASE_ANON_KEY:-}}" ] && echo yes || echo no)"
 
-          # Map legacy service_role → SECRET_KEY for server-side supabase-py writes only.
           if [ -z "${SUPABASE_SECRET_KEY:-}" ] && [ -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ]; then
             export SUPABASE_SECRET_KEY="${SUPABASE_SERVICE_ROLE_KEY}"
           fi
-          if [ -z "${SUPABASE_ANON_KEY:-}" ] && [ -n "${NEXT_PUBLIC_SUPABASE_ANON_KEY:-}" ]; then
-            export SUPABASE_ANON_KEY="${NEXT_PUBLIC_SUPABASE_ANON_KEY}"
-          fi
 
+          if [ -z "${SUPABASE_URL:-}" ]; then
+            echo "::error::SUPABASE_URL missing after verify step"
+            exit 1
+          fi
           if [ -z "${SUPABASE_SECRET_KEY:-}" ]; then
             echo "::error::SUPABASE_SECRET_KEY (or SUPABASE_SERVICE_ROLE_KEY) is required"
             exit 1
           fi
 
-          URL="${SUPABASE_URL:-${NEXT_PUBLIC_SUPABASE_URL:-$DEFAULT_URL}}"
-          URL="$(echo "$URL" | sed -e 's/^[[:space:]\"'\'']*//' -e 's/[[:space:]\"'\'']*$//' -e 's#/*$##')"
-          if [ -z "$URL" ]; then
-            URL="$DEFAULT_URL"
-          elif ! echo "$URL" | grep -Eqi '^https?://'; then
-            URL="https://${URL#/}"
-          elif echo "$URL" | grep -Eqi '^http://'; then
-            URL="https://${URL#http://}"
-          fi
-          HOST="$(echo "$URL" | sed -E 's#https?://([^/]+).*#\1#')"
-          case "$HOST" in
-            ujhsltihinwuysikzvhs.supabase.co|ujhsltlhinwuysikzvhs.supabase.co)
-              URL="$DEFAULT_URL"
-              ;;
-          esac
-          if ! getent hosts "$(echo "$URL" | sed -E 's#https?://([^/]+).*#\1#')" >/dev/null 2>&1; then
-            URL="$DEFAULT_URL"
-          fi
-          export SUPABASE_URL="$URL"
-          export NEXT_PUBLIC_SUPABASE_URL="$URL"
           echo "[scraper-ci] Connecting to Supabase at: ${SUPABASE_URL}"
-          echo "[scraper-ci] Writes use supabase-py + SUPABASE_SECRET_KEY (fail-closed)"
+          echo "[scraper-ci] Volume floors TARGET=${SCRAPER_TARGET_MIN} SUPPORT=${SCRAPER_SUPPORT_MIN} SALES=${SCRAPER_SALES_MIN}"
           python scrape_jobs.py
           code=$?
           echo "[scraper-ci] scrape_jobs.py finished with exit code ${code}"
