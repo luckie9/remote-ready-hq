@@ -239,31 +239,73 @@ BROWSER_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-# Safe project fallback when CI secret is empty / missing protocol
-DEFAULT_SUPABASE_URL = "https://ujhsltihinwuysikzvhs.supabase.co"
+# Live project host (resolves in DNS). Typo refs like ujhsltihinwuysikzvhs do NOT.
+DEFAULT_SUPABASE_URL = "https://ujhsltlhlnwuysikzvhs.supabase.co"
+# Common mistyped project refs seen in CI secrets / prior hardcodes
+_BAD_SUPABASE_HOSTS = {
+    "ujhsltihinwuysikzvhs.supabase.co",
+    "ujhsltlhinwuysikzvhs.supabase.co",
+}
 
 
 def normalize_supabase_url(raw: str | None) -> str:
-    """Strip whitespace and force https:// before client init."""
+    """Strip whitespace/quotes, force https://, drop trailing slash."""
     value = (raw or "").strip().strip("'").strip('"')
     if not value:
-        value = DEFAULT_SUPABASE_URL
-    # Missing or non-http(s) scheme → force https
+        return DEFAULT_SUPABASE_URL
     if not re.match(r"^https?://", value, flags=re.I):
         value = "https://" + value.lstrip("/")
-    # Prefer https even if http was provided
     if value.lower().startswith("http://"):
         value = "https://" + value[7:]
     return value.rstrip("/")
 
 
+def _host_resolves(host: str) -> bool:
+    if not host:
+        return False
+    try:
+        import socket
+
+        socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+        return True
+    except OSError as err:
+        _log_err(f"[scraper] DNS lookup failed for {host}: {err}")
+        return False
+
+
+def resolve_supabase_url(raw: str | None) -> str:
+    """
+    Sanitize env URL and automatically fall back when empty, schemeless,
+    known-bad typo host, or DNS resolution fails.
+    """
+    candidate = normalize_supabase_url(raw)
+    host = urlparse(candidate).netloc.lower()
+
+    if host in _BAD_SUPABASE_HOSTS:
+        _log(
+            f"[scraper] SUPABASE_URL host {host} is a known typo — "
+            f"falling back to {DEFAULT_SUPABASE_URL}"
+        )
+        return DEFAULT_SUPABASE_URL
+
+    if not _host_resolves(host):
+        _log(
+            f"[scraper] SUPABASE_URL host {host} does not resolve — "
+            f"falling back to {DEFAULT_SUPABASE_URL}"
+        )
+        return DEFAULT_SUPABASE_URL
+
+    return candidate
+
+
 def require_supabase() -> tuple[str, str]:
     """Return (url, key). Raises ValueError if service key is missing/blank."""
-    _log("[scraper] Connecting to Supabase…")
     raw_url = os.environ.get("SUPABASE_URL") or os.environ.get(
         "NEXT_PUBLIC_SUPABASE_URL"
     )
-    url = normalize_supabase_url(raw_url)
+    url = resolve_supabase_url(raw_url)
+    print(f"[scraper] Connecting to Supabase at: {url}", flush=True)
+
     # Prefer service-role key, then secret key aliases (never KeyError on missing)
     key = (
         os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
@@ -272,16 +314,9 @@ def require_supabase() -> tuple[str, str]:
         or ""
     ).strip()
 
-    host = ""
-    try:
-        host = urlparse(url).netloc if url else ""
-    except Exception:
-        host = ""
-
+    host = urlparse(url).netloc
     preview = url[:15] + ("..." if len(url) > 15 else "")
     print(f"[scraper] Supabase URL detected: {preview}", flush=True)
-    if not (raw_url or "").strip():
-        _log(f"[scraper] Using DEFAULT_SUPABASE_URL fallback ({host})")
 
     key_source = "none"
     if (os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip():
@@ -293,8 +328,7 @@ def require_supabase() -> tuple[str, str]:
 
     _log(
         "[scraper] env check: "
-        f"SUPABASE_URL host={host or '(none)'} "
-        f"key_source={key_source} key_len={len(key)} "
+        f"host={host or '(none)'} key_source={key_source} key_len={len(key)} "
         f"TARGET_MIN={TARGET_MIN} SUPPORT_MIN={SUPPORT_MIN} SALES_MIN={SALES_MIN}"
     )
 
@@ -308,6 +342,7 @@ def require_supabase() -> tuple[str, str]:
 
 def verify_supabase(url: str, key: str) -> bool:
     """Probe Supabase REST; warn and return False on DNS/auth/network failure."""
+    print(f"[scraper] Connecting to Supabase at: {url}", flush=True)
     probe = f"{url}/rest/v1/jobs?select=id&limit=1"
     req = urllib.request.Request(
         probe,
@@ -324,16 +359,16 @@ def verify_supabase(url: str, key: str) -> bool:
             _log(f"[scraper] Supabase auth OK (HTTP {resp.status})")
             return True
     except urllib.error.HTTPError as err:
-        raw = err.read().decode("utf-8", errors="replace")[:300]
+        raw = err.read().decode("utf-8", errors="replace")[:500]
         _log_err(
             f"[scraper] WARNING: Supabase URL/key failed to authenticate "
-            f"(HTTP {err.code}): {raw}"
+            f"(HTTP {err.code}) body={raw!r}"
         )
         return False
     except Exception as err:
         _log_err(
             f"[scraper] WARNING: Supabase connection failed "
-            f"({type(err).__name__}: {err}). "
+            f"({type(err).__name__}: {err!r}). "
             "Check SUPABASE_URL host spelling and SUPABASE_SERVICE_ROLE_KEY / "
             "SUPABASE_SECRET_KEY secrets."
         )
@@ -348,6 +383,8 @@ def supabase_request(
     prefer: str | None = None,
 ) -> tuple[int, object]:
     url, key = require_supabase()
+    target = f"{url}{path}"
+    print(f"[scraper] Connecting to Supabase at: {url} ({method} {path})", flush=True)
     headers = {
         "apikey": key,
         "Authorization": f"Bearer {key}",
@@ -358,18 +395,27 @@ def supabase_request(
     if prefer:
         headers["Prefer"] = prefer
     data = None if body is None else json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(
-        f"{url}{path}", data=data, headers=headers, method=method
-    )
+    req = urllib.request.Request(target, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=90) as resp:
             raw = resp.read().decode("utf-8")
             return resp.status, json.loads(raw) if raw else None
     except urllib.error.HTTPError as err:
         raw = err.read().decode("utf-8", errors="replace")
+        print(
+            f"[scraper] supabase_request HTTPError {err.code} for {target}: {raw[:500]}",
+            flush=True,
+        )
         raise RuntimeError(
             f"Supabase {method} {path} → {err.code}: {raw[:400]}"
         ) from err
+    except Exception as err:
+        print(
+            f"[scraper] supabase_request failed for {target}: "
+            f"{type(err).__name__}: {err!r}",
+            flush=True,
+        )
+        raise
 
 
 def make_listing(
