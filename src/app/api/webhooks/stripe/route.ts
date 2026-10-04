@@ -22,26 +22,61 @@ async function upsertSubscriber(params: {
     .eq('email', email)
     .maybeSingle();
 
+  const unlocked =
+    params.status === 'active' ||
+    params.status === 'trialing' ||
+    params.status === 'paid';
+  const unlockExpiresAt = params.currentPeriodEnd
+    ? new Date(params.currentPeriodEnd * 1000).toISOString()
+    : unlocked
+      ? new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString()
+      : null;
+
+  const userPayload: Record<string, unknown> = {
+    email,
+    stripe_customer_id: params.stripeCustomerId ?? null,
+    updated_at: new Date().toISOString(),
+    active_subscriber: unlocked,
+    unlock_expires_at: unlockExpiresAt,
+  };
+
   let userId = existingUser?.id as string | undefined;
   if (!userId) {
     const { data: created, error } = await admin
       .from('users')
-      .insert({
-        email,
-        stripe_customer_id: params.stripeCustomerId ?? null,
-      })
+      .insert(userPayload)
       .select('id')
       .single();
-    if (error) throw error;
-    userId = created.id;
-  } else if (params.stripeCustomerId) {
-    await admin
+    if (error) {
+      // Retry without unlock columns if schema not migrated yet
+      const { data: createdFallback, error: fallbackErr } = await admin
+        .from('users')
+        .insert({
+          email,
+          stripe_customer_id: params.stripeCustomerId ?? null,
+          updated_at: new Date().toISOString(),
+        })
+        .select('id')
+        .single();
+      if (fallbackErr) throw fallbackErr;
+      userId = createdFallback.id;
+    } else {
+      userId = created.id;
+    }
+  } else {
+    const { error: updateErr } = await admin
       .from('users')
-      .update({
-        stripe_customer_id: params.stripeCustomerId,
-        updated_at: new Date().toISOString(),
-      })
+      .update(userPayload)
       .eq('id', userId);
+    if (updateErr) {
+      await admin
+        .from('users')
+        .update({
+          stripe_customer_id: params.stripeCustomerId ?? null,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', userId);
+    }
   }
 
   const row = {

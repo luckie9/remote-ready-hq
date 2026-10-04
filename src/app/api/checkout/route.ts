@@ -7,7 +7,7 @@ type CheckoutBody = {
   email?: string;
 };
 
-const PRODUCTION_APP_URL = 'https://remote-ready-hq.vercel.app';
+const PRODUCTION_APP_URL = 'https://remotereadyhq.com';
 
 /** Prefer live request origin, then public/Vercel env, never sticky localhost in prod. */
 function resolveAppUrl(request: Request): string {

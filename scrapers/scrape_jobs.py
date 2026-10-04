@@ -38,6 +38,15 @@ SUPABASE_KEY = (
     or ""
 )
 
+
+def _log(msg: str) -> None:
+    """Stdout logger (unbuffered in CI via PYTHONUNBUFFERED=1)."""
+    print(msg, flush=True)
+
+
+def _log_err(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
+
 TARGET_MIN = int(os.getenv("SCRAPER_TARGET_MIN", "120"))
 SUPPORT_MIN = int(os.getenv("SCRAPER_SUPPORT_MIN", "30"))
 SALES_MIN = int(os.getenv("SCRAPER_SALES_MIN", "30"))
@@ -210,10 +219,38 @@ def stamp_description(description: str, category: str) -> str:
 
 
 def require_supabase() -> tuple[str, str]:
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        print("Missing Supabase env vars", file=sys.stderr)
+    url = SUPABASE_URL
+    key = SUPABASE_KEY
+    host = ""
+    try:
+        host = urlparse(url).netloc if url else ""
+    except Exception:
+        host = ""
+
+    _log(
+        "[scraper] env check: "
+        f"SUPABASE_URL={'yes' if url else 'NO'} host={host or '(none)'} "
+        f"SUPABASE_KEY={'yes' if key else 'NO'} key_len={len(key)}"
+    )
+
+    missing = []
+    if not url:
+        missing.append("SUPABASE_URL or NEXT_PUBLIC_SUPABASE_URL")
+    if not key:
+        missing.append(
+            "SUPABASE_SECRET_KEY or SUPABASE_SERVICE_ROLE_KEY"
+        )
+    if missing:
+        _log_err(
+            "[scraper] FATAL: missing required environment variables: "
+            + ", ".join(missing)
+        )
+        _log_err(
+            "[scraper] Set these in GitHub Actions secrets / local scrapers/.env "
+            "or project .env.local"
+        )
         sys.exit(1)
-    return SUPABASE_URL, SUPABASE_KEY
+    return url, key
 
 
 def supabase_request(
@@ -559,28 +596,44 @@ def category_breakdown(jobs: list[JobListing]) -> dict[str, int]:
 
 
 def main() -> int:
-    print(f"RemoteReady HQ scraper — {datetime.now(timezone.utc).isoformat()}")
-    require_supabase()
-    scraped = scrape_all()
-    unique = deduplicate(scraped)
-    print(f"Scraped {len(scraped)} → {len(unique)} after dedupe.")
-    print("Category mix (scraped unique):", category_breakdown(unique))
+    _log(f"[scraper] RemoteReady HQ scraper — {datetime.now(timezone.utc).isoformat()}")
+    _log(f"[scraper] cwd={Path.cwd()} script={Path(__file__).resolve()}")
+    try:
+        require_supabase()
+        _log("[scraper] Starting scrape_all()…")
+        scraped = scrape_all()
+        unique = deduplicate(scraped)
+        _log(f"[scraper] Scraped {len(scraped)} → {len(unique)} after dedupe.")
+        _log(f"[scraper] Category mix: {category_breakdown(unique)}")
 
-    if not unique:
-        return 1
+        if not unique:
+            _log_err("[scraper] FATAL: no jobs scraped; aborting insert.")
+            return 1
 
-    # Prefer inserting Support/Sales first to hit pillar targets
-    priority = sorted(
-        unique,
-        key=lambda j: (0 if j.category in ("Support", "Sales") else 1, j.title),
-    )
-    inserted, skipped = insert_jobs(priority)
-    total = count_jobs()
-    print(
-        f"Inserted {inserted}; skipped {skipped}. DB total={total}. "
-        f"Targets: total>={TARGET_MIN}, Support>={SUPPORT_MIN}, Sales>={SALES_MIN}"
-    )
-    return 0 if total >= TARGET_MIN else 1
+        # Prefer inserting Support/Sales first to hit pillar targets
+        priority = sorted(
+            unique,
+            key=lambda j: (0 if j.category in ("Support", "Sales") else 1, j.title),
+        )
+        _log("[scraper] Inserting into Supabase…")
+        inserted, skipped = insert_jobs(priority)
+        total = count_jobs()
+        _log(
+            f"[scraper] Inserted {inserted}; skipped {skipped}. DB total={total}. "
+            f"Targets: total>={TARGET_MIN}, Support>={SUPPORT_MIN}, Sales>={SALES_MIN}"
+        )
+        if total < TARGET_MIN:
+            _log_err(
+                f"[scraper] WARNING: DB total {total} below TARGET_MIN {TARGET_MIN}"
+            )
+            return 1
+        _log("[scraper] Completed successfully.")
+        return 0
+    except SystemExit:
+        raise
+    except Exception as err:
+        _log_err(f"[scraper] FATAL unhandled error: {type(err).__name__}: {err}")
+        raise
 
 
 if __name__ == "__main__":

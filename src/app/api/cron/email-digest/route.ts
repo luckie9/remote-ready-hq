@@ -1,11 +1,22 @@
 import { promises as fs } from 'fs';
 import path from 'path';
 import { NextResponse } from 'next/server';
-import { Resend } from 'resend';
 import {
   createAdminSupabase,
   isMissingRelationError,
 } from '@/lib/supabase';
+
+/** Lazy-load Resend so builds don't hard-fail if the package is briefly missing. */
+async function createResendClient(apiKey: string) {
+  try {
+    const mod = await import('resend');
+    return new mod.Resend(apiKey);
+  } catch (err) {
+    throw new Error(
+      `Resend package unavailable: ${err instanceof Error ? err.message : String(err)}. Ensure "resend" is in package.json dependencies.`
+    );
+  }
+}
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -17,7 +28,7 @@ const FALLBACK_ALERTS = path.join(
   '.job_alerts.json'
 );
 
-const PRODUCTION_APP_URL = 'https://remote-ready-hq.vercel.app';
+const PRODUCTION_APP_URL = 'https://remotereadyhq.com';
 const MAX_JOBS_IN_EMAIL = 12;
 const BATCH_SIZE = 50;
 
@@ -243,7 +254,7 @@ async function runDigest() {
     });
   }
 
-  const resend = new Resend(resendKey);
+  const resend = await createResendClient(resendKey);
   const html = buildDigestHtml(jobs, siteUrl);
   const subject = `${jobs.length} new remote role${jobs.length === 1 ? '' : 's'} today — RemoteReady HQ`;
 

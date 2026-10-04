@@ -8,7 +8,7 @@ import { applySubscriberCookie } from '@/lib/subscription';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-const PRODUCTION_APP_URL = 'https://remote-ready-hq.vercel.app';
+const PRODUCTION_APP_URL = 'https://remotereadyhq.com';
 
 function resolveAppUrl(request: Request): string {
   try {

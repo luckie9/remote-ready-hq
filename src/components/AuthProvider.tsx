@@ -10,6 +10,7 @@ import {
   useState,
   type ReactNode,
 } from 'react';
+import { useRouter } from 'next/navigation';
 import type { User } from '@supabase/supabase-js';
 import { createClient } from '@/lib/supabase/client';
 
@@ -93,7 +94,19 @@ function markTriggerFired(index: number) {
   window.sessionStorage.setItem(ALERT_FIRED_KEY, JSON.stringify([...fired]));
 }
 
+async function syncUnlockCookie(): Promise<boolean> {
+  try {
+    const res = await fetch('/api/subscription/sync', { method: 'POST' });
+    if (!res.ok) return false;
+    const data = (await res.json()) as { unlocked?: boolean };
+    return Boolean(data.unlocked);
+  } catch {
+    return false;
+  }
+}
+
 export function AuthProvider({ children }: { children: ReactNode }) {
+  const router = useRouter();
   const supabase = useMemo(() => createClient(), []);
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(false);
@@ -103,6 +116,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [hasSubscribedAlerts, setHasSubscribedAlerts] = useState(false);
   const alertOpenRef = useRef(false);
   const scheduleGenRef = useRef(0);
+  const lastSyncedUserId = useRef<string | null>(null);
 
   useEffect(() => {
     alertOpenRef.current = alertOpen;
@@ -159,6 +173,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     void refreshApplications();
   }, [user?.id, refreshApplications]);
+
+  // After sign-in, sync paid unlock from Supabase → cookie and refresh RSC paywall.
+  useEffect(() => {
+    if (!user?.id) {
+      lastSyncedUserId.current = null;
+      return;
+    }
+    if (lastSyncedUserId.current === user.id) return;
+    lastSyncedUserId.current = user.id;
+    void (async () => {
+      const unlocked = await syncUnlockCookie();
+      if (unlocked) router.refresh();
+    })();
+  }, [user?.id, router]);
 
   const scheduleNextAlert = useCallback(() => {
     if (typeof window === 'undefined') return;

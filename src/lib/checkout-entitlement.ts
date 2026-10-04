@@ -82,26 +82,50 @@ export async function fulfillCheckoutSession(
       .eq('email', normalized)
       .maybeSingle();
 
+    const unlockExpiresAt = new Date(exp).toISOString();
+    const userPayload: Record<string, unknown> = {
+      email: normalized,
+      stripe_customer_id: customerId,
+      updated_at: new Date().toISOString(),
+      active_subscriber: true,
+      unlock_expires_at: unlockExpiresAt,
+    };
+
     let userId = existingUser?.id as string | undefined;
     if (!userId) {
-      const { data: created } = await admin
+      const { data: created, error: createErr } = await admin
         .from('users')
-        .insert({
-          email: normalized,
-          stripe_customer_id: customerId,
-          updated_at: new Date().toISOString(),
-        })
+        .insert(userPayload)
         .select('id')
         .single();
-      userId = created?.id;
+      if (createErr) {
+        const { data: createdFallback } = await admin
+          .from('users')
+          .insert({
+            email: normalized,
+            stripe_customer_id: customerId,
+            updated_at: new Date().toISOString(),
+          })
+          .select('id')
+          .single();
+        userId = createdFallback?.id;
+      } else {
+        userId = created?.id;
+      }
     } else {
-      await admin
+      const { error: updateErr } = await admin
         .from('users')
-        .update({
-          stripe_customer_id: customerId,
-          updated_at: new Date().toISOString(),
-        })
+        .update(userPayload)
         .eq('id', userId);
+      if (updateErr) {
+        await admin
+          .from('users')
+          .update({
+            stripe_customer_id: customerId,
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', userId);
+      }
     }
 
     if (userId) {

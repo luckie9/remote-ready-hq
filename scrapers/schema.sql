@@ -21,9 +21,16 @@ create table if not exists public.users (
   id uuid primary key default gen_random_uuid(),
   email text not null unique,
   stripe_customer_id text,
+  active_subscriber boolean not null default false,
+  unlock_expires_at timestamptz,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+
+alter table public.users
+  add column if not exists active_subscriber boolean not null default false;
+alter table public.users
+  add column if not exists unlock_expires_at timestamptz;
 
 create table if not exists public.subscriptions (
   id uuid primary key default gen_random_uuid(),
