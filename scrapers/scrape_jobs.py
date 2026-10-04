@@ -28,6 +28,47 @@ ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
 load_dotenv(ROOT.parent / ".env.local")
 
+# Live project host that resolves in DNS (typo refs like ujhsltihinwuysikzvhs do not).
+_DEFAULT_SUPABASE_URL = "https://ujhsltlhlnwuysikzvhs.supabase.co"
+
+
+def _sanitize_url(raw: str | None) -> str:
+    value = (raw or "").strip().strip("'").strip('"')
+    if not value:
+        return _DEFAULT_SUPABASE_URL
+    if not re.match(r"^https?://", value, flags=re.I):
+        value = "https://" + value.lstrip("/")
+    if value.lower().startswith("http://"):
+        value = "https://" + value[7:]
+    value = value.rstrip("/")
+    host = urlparse(value).netloc.lower()
+    # Rewrite known non-resolving typo hosts from CI secrets / older hardcodes
+    if host in {
+        "ujhsltihinwuysikzvhs.supabase.co",
+        "ujhsltlhinwuysikzvhs.supabase.co",
+    }:
+        return _DEFAULT_SUPABASE_URL
+    return value
+
+
+# Hardcoded resolution at import — env first, then safe default URL
+SUPABASE_URL = _sanitize_url(
+    os.environ.get("SUPABASE_URL") or os.environ.get("NEXT_PUBLIC_SUPABASE_URL")
+)
+SUPABASE_KEY = (
+    os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+    or os.environ.get("SUPABASE_SECRET_KEY")
+    or os.environ.get("SUPABASE_KEY")
+    or ""
+).strip()
+
+print(
+    f"[scraper] Supabase Client Initialized: URL={SUPABASE_URL}, "
+    f"Key Present={bool(SUPABASE_KEY)}",
+    flush=True,
+)
+
+
 def _log(msg: str) -> None:
     """Stdout logger (unbuffered in CI via PYTHONUNBUFFERED=1)."""
     print(msg, flush=True)
@@ -239,140 +280,41 @@ BROWSER_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-# Live project host (resolves in DNS). Typo refs like ujhsltihinwuysikzvhs do NOT.
-DEFAULT_SUPABASE_URL = "https://ujhsltlhlnwuysikzvhs.supabase.co"
-# Common mistyped project refs seen in CI secrets / prior hardcodes
-_BAD_SUPABASE_HOSTS = {
-    "ujhsltihinwuysikzvhs.supabase.co",
-    "ujhsltlhinwuysikzvhs.supabase.co",
-}
+def refresh_supabase_credentials() -> tuple[str, str]:
+    """Re-read env (and apply sanitization) so late-exported CI vars are picked up."""
+    global SUPABASE_URL, SUPABASE_KEY
+    SUPABASE_URL = _sanitize_url(
+        os.environ.get("SUPABASE_URL") or os.environ.get("NEXT_PUBLIC_SUPABASE_URL")
+    )
+    SUPABASE_KEY = (
+        os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+        or os.environ.get("SUPABASE_SECRET_KEY")
+        or os.environ.get("SUPABASE_KEY")
+        or ""
+    ).strip()
+    return SUPABASE_URL, SUPABASE_KEY
 
 
-def normalize_supabase_url(raw: str | None) -> str:
-    """Strip whitespace/quotes, force https://, drop trailing slash."""
-    value = (raw or "").strip().strip("'").strip('"')
-    if not value:
-        return DEFAULT_SUPABASE_URL
-    if not re.match(r"^https?://", value, flags=re.I):
-        value = "https://" + value.lstrip("/")
-    if value.lower().startswith("http://"):
-        value = "https://" + value[7:]
-    return value.rstrip("/")
-
-
-def _host_resolves(host: str) -> bool:
-    if not host:
-        return False
-    try:
-        import socket
-
-        socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
-        return True
-    except OSError as err:
-        _log_err(f"[scraper] DNS lookup failed for {host}: {err}")
-        return False
-
-
-def resolve_supabase_url(raw: str | None) -> str:
-    """
-    Sanitize env URL and automatically fall back when empty, schemeless,
-    known-bad typo host, or DNS resolution fails.
-    """
-    candidate = normalize_supabase_url(raw)
-    host = urlparse(candidate).netloc.lower()
-
-    if host in _BAD_SUPABASE_HOSTS:
-        _log(
-            f"[scraper] SUPABASE_URL host {host} is a known typo — "
-            f"falling back to {DEFAULT_SUPABASE_URL}"
-        )
-        return DEFAULT_SUPABASE_URL
-
-    if not _host_resolves(host):
-        _log(
-            f"[scraper] SUPABASE_URL host {host} does not resolve — "
-            f"falling back to {DEFAULT_SUPABASE_URL}"
-        )
-        return DEFAULT_SUPABASE_URL
-
-    return candidate
+def supabase_available() -> bool:
+    """Credentials present ⇒ treat Supabase as available and attempt writes."""
+    url, key = refresh_supabase_credentials()
+    return bool(url and key)
 
 
 def require_supabase() -> tuple[str, str]:
     """Return (url, key). Raises ValueError if service key is missing/blank."""
-    raw_url = os.environ.get("SUPABASE_URL") or os.environ.get(
-        "NEXT_PUBLIC_SUPABASE_URL"
-    )
-    url = resolve_supabase_url(raw_url)
+    url, key = refresh_supabase_credentials()
     print(f"[scraper] Connecting to Supabase at: {url}", flush=True)
-
-    # Prefer service-role key, then secret key aliases (never KeyError on missing)
-    key = (
-        os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-        or os.environ.get("SUPABASE_SECRET_KEY")
-        or os.environ.get("SUPABASE_SERVICE_KEY")
-        or ""
-    ).strip()
-
-    host = urlparse(url).netloc
-    preview = url[:15] + ("..." if len(url) > 15 else "")
-    print(f"[scraper] Supabase URL detected: {preview}", flush=True)
-
-    key_source = "none"
-    if (os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip():
-        key_source = "SUPABASE_SERVICE_ROLE_KEY"
-    elif (os.environ.get("SUPABASE_SECRET_KEY") or "").strip():
-        key_source = "SUPABASE_SECRET_KEY"
-    elif (os.environ.get("SUPABASE_SERVICE_KEY") or "").strip():
-        key_source = "SUPABASE_SERVICE_KEY"
-
-    _log(
-        "[scraper] env check: "
-        f"host={host or '(none)'} key_source={key_source} key_len={len(key)} "
-        f"TARGET_MIN={TARGET_MIN} SUPPORT_MIN={SUPPORT_MIN} SALES_MIN={SALES_MIN}"
+    print(
+        f"[scraper] Supabase Client Initialized: URL={url}, Key Present={bool(key)}",
+        flush=True,
     )
-
     if not key:
         raise ValueError(
             "missing required environment variables: "
-            "SUPABASE_SERVICE_ROLE_KEY or SUPABASE_SECRET_KEY"
+            "SUPABASE_SERVICE_ROLE_KEY or SUPABASE_SECRET_KEY or SUPABASE_KEY"
         )
     return url, key
-
-
-def verify_supabase(url: str, key: str) -> bool:
-    """Probe Supabase REST; warn and return False on DNS/auth/network failure."""
-    print(f"[scraper] Connecting to Supabase at: {url}", flush=True)
-    probe = f"{url}/rest/v1/jobs?select=id&limit=1"
-    req = urllib.request.Request(
-        probe,
-        headers={
-            "apikey": key,
-            "Authorization": f"Bearer {key}",
-            "Accept": "application/json",
-            "User-Agent": BROWSER_UA,
-        },
-        method="GET",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            _log(f"[scraper] Supabase auth OK (HTTP {resp.status})")
-            return True
-    except urllib.error.HTTPError as err:
-        raw = err.read().decode("utf-8", errors="replace")[:500]
-        _log_err(
-            f"[scraper] WARNING: Supabase URL/key failed to authenticate "
-            f"(HTTP {err.code}) body={raw!r}"
-        )
-        return False
-    except Exception as err:
-        _log_err(
-            f"[scraper] WARNING: Supabase connection failed "
-            f"({type(err).__name__}: {err!r}). "
-            "Check SUPABASE_URL host spelling and SUPABASE_SERVICE_ROLE_KEY / "
-            "SUPABASE_SECRET_KEY secrets."
-        )
-        return False
 
 
 def supabase_request(
@@ -795,30 +737,21 @@ def main() -> int:
     inserted = 0
     _log(f"[scraper] RemoteReady HQ scraper — {datetime.now(timezone.utc).isoformat()}")
     _log(f"[scraper] cwd={Path.cwd()} script={Path(__file__).resolve()}")
-    try:
-        try:
-            url, key = require_supabase()
-            if not verify_supabase(url, key):
-                print(
-                    "Error scraping target: Supabase URL or SERVICE_ROLE/SECRET key "
-                    "failed to authenticate — continuing scrape without DB writes",
-                    flush=True,
-                )
-                # Still scrape sources for observability, then exit 0
-                try:
-                    scraped = scrape_all()
-                    unique = deduplicate(scraped)
-                    _log(
-                        f"[scraper] Scraped {len(scraped)} → {len(unique)} after dedupe "
-                        "(not written — Supabase unavailable)."
-                    )
-                except Exception as e:
-                    print(f"Error scraping target: {e}", flush=True)
-                return 0
-        except Exception as e:
-            print(f"Error scraping target: {e}", flush=True)
-            return 0
 
+    # Re-read credentials after CI exports; presence of URL+KEY ⇒ attempt writes
+    url, key = refresh_supabase_credentials()
+    print(
+        f"[scraper] Supabase Client Initialized: URL={url}, Key Present={bool(key)}",
+        flush=True,
+    )
+    can_write = supabase_available()
+    if not can_write:
+        print(
+            "[scraper] WARNING: SUPABASE_KEY missing — will scrape but cannot write.",
+            flush=True,
+        )
+
+    try:
         _log("[scraper] Starting scrape_all()…")
         try:
             scraped = scrape_all()
@@ -830,7 +763,7 @@ def main() -> int:
         _log(f"[scraper] Scraped {len(scraped)} → {len(unique)} after dedupe.")
         _log(f"[scraper] Category mix: {category_breakdown(unique)}")
 
-        if unique:
+        if unique and can_write:
             priority = sorted(
                 unique,
                 key=lambda j: (
@@ -839,6 +772,7 @@ def main() -> int:
                 ),
             )
             _log("[scraper] Inserting into Supabase…")
+            print(f"[scraper] Connecting to Supabase at: {SUPABASE_URL}", flush=True)
             try:
                 inserted, skipped = insert_jobs(priority)
                 total = count_jobs()
@@ -848,6 +782,11 @@ def main() -> int:
                 )
             except Exception as e:
                 print(f"Error scraping target: {e}", flush=True)
+        elif unique and not can_write:
+            _log(
+                f"[scraper] Scraped {len(scraped)} → {len(unique)} after dedupe "
+                "(not written — SUPABASE_KEY missing)."
+            )
         else:
             _log("[scraper] No jobs scraped from any source this run.")
 
