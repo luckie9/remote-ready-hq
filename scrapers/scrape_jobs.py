@@ -46,39 +46,122 @@ def _env_str(name: str) -> str:
     return str(value).strip().strip("'").strip('"')
 
 
-def _normalize_project_id(raw: str) -> str:
-    """Accept bare project ref or a full *.supabase.co host/URL."""
-    value = (raw or "").strip().strip("'").strip('"')
-    if not value:
-        return ""
-    # If a full URL/host was pasted, extract the project ref.
-    if "://" in value or "." in value:
-        host = urlparse(
-            value if "://" in value else f"https://{value}"
-        ).netloc.lower()
-        if host.endswith(".supabase.co"):
-            return host[: -len(".supabase.co")]
+def _clean_project_id_url_raw(raw: str | None) -> str:
+    """
+    Strip whitespace, quotes, trailing slashes, and common accidental wrappers
+    from PROJECT_ID_URL before resolution.
+    """
+    value = "" if raw is None else str(raw)
+    value = value.strip().strip("'").strip('"').strip("`").strip()
+    # Collapse internal whitespace / newlines from secrets UI paste
+    value = re.sub(r"\s+", "", value)
+    value = value.rstrip("/")
+    # Accidental prefixes from copy-paste
+    for prefix in ("url=", "URL=", "host=", "HOST=", "supabase_url=", "SUPABASE_URL="):
+        if value.lower().startswith(prefix.lower()):
+            value = value[len(prefix) :]
+    value = value.strip().rstrip("/")
     return value
 
 
-def build_supabase_url(project_id: str | None = None) -> str:
-    """Construct https://{PROJECT_ID_URL}.supabase.co from PROJECT_ID_URL."""
-    pid = _normalize_project_id(
-        project_id if project_id is not None else _env_str("PROJECT_ID_URL")
+def resolve_supabase_url(raw: str | None = None) -> tuple[str, str]:
+    """
+    Bulletproof PROJECT_ID_URL → (project_ref, https_base_url).
+
+    Accepts:
+      - raw project ref:  ujhsltlhlnwuysikzvhs
+      - host:             ujhsltlhlnwuysikzvhs.supabase.co
+      - https URL:        https://ujhsltlhlnwuysikzvhs.supabase.co[/...]
+      - http URL:         upgraded to https
+    """
+    value = _clean_project_id_url_raw(
+        raw if raw is not None else os.environ.get("PROJECT_ID_URL")
     )
-    if not pid:
-        return ""
-    return f"https://{pid}.supabase.co"
+    if not value:
+        return "", ""
+
+    # Scheme-less host that already includes .supabase.co
+    lower = value.lower()
+    if not lower.startswith("http://") and not lower.startswith("https://"):
+        if ".supabase.co" in lower:
+            # e.g. project.supabase.co or project.supabase.co/rest/v1
+            host_part = value.split("/")[0]
+            host_part = host_part.split("?")[0].strip().lower()
+            if host_part.endswith(".supabase.co"):
+                ref = host_part[: -len(".supabase.co")]
+                ref = ref.strip(".").strip()
+                if ref:
+                    return ref, f"https://{ref}.supabase.co"
+        # Raw project id (letters, digits, hyphens)
+        ref = value.strip().strip(".")
+        if not ref:
+            return "", ""
+        # Guard against doubled suffix: "abc.supabase.co.supabase.co"
+        if ref.lower().endswith(".supabase.co"):
+            ref = ref[: -len(".supabase.co")]
+        return ref, f"https://{ref}.supabase.co"
+
+    # Full URL with scheme
+    if lower.startswith("http://"):
+        value = "https://" + value[7:]
+        lower = value.lower()
+
+    parsed = urlparse(value)
+    host = (parsed.netloc or "").lower().strip()
+    if not host and parsed.path:
+        # Edge: https://project-ref  (rare; treat path as host)
+        host = parsed.path.split("/")[0].lower()
+
+    if not host:
+        return "", ""
+
+    if host.endswith(".supabase.co"):
+        ref = host[: -len(".supabase.co")].strip(".")
+        if not ref:
+            return "", ""
+        return ref, f"https://{ref}.supabase.co"
+
+    # https://<raw-project-id> with no .supabase.co yet
+    if "." not in host:
+        return host, f"https://{host}.supabase.co"
+
+    # Unknown host shape — still force https base from host
+    return host.split(".")[0], f"https://{host}"
+
+
+def mask_supabase_url(url: str) -> str:
+    """Mask project ref in logs: https://abcd****wxyz.supabase.co"""
+    if not url:
+        return "(missing)"
+    try:
+        host = urlparse(url).netloc.lower()
+        if not host.endswith(".supabase.co"):
+            return "https://***.supabase.co"
+        ref = host[: -len(".supabase.co")]
+        if len(ref) <= 8:
+            masked_ref = ref[:2] + "***" + ref[-2:] if len(ref) >= 4 else "***"
+        else:
+            masked_ref = ref[:4] + "****" + ref[-4:]
+        return f"https://{masked_ref}.supabase.co"
+    except Exception:
+        return "https://****.supabase.co"
+
+
+def build_supabase_url(project_id: str | None = None) -> str:
+    """Return resolved https://{ref}.supabase.co from PROJECT_ID_URL or argument."""
+    _ref, url = resolve_supabase_url(project_id)
+    return url
 
 
 def refresh_supabase_credentials() -> tuple[str, str, str, str]:
     """
     Re-read GitHub Secrets–aligned env vars.
-    Returns (project_id_url, supabase_url, publishable_key, secret_keys).
+    Returns (project_ref, supabase_url, publishable_key, secret_keys).
     """
     global PROJECT_ID_URL, SUPABASE_URL, PUBLISHABLE_KEY, SECRET_KEYS
-    PROJECT_ID_URL = _normalize_project_id(_env_str("PROJECT_ID_URL"))
-    SUPABASE_URL = build_supabase_url(PROJECT_ID_URL)
+    PROJECT_ID_URL, SUPABASE_URL = resolve_supabase_url(
+        os.environ.get("PROJECT_ID_URL")
+    )
     PUBLISHABLE_KEY = _env_str("PUBLISHABLE_KEY")
     SECRET_KEYS = _env_str("SECRET_KEYS")
     return PROJECT_ID_URL, SUPABASE_URL, PUBLISHABLE_KEY, SECRET_KEYS
@@ -89,7 +172,7 @@ PROJECT_ID_URL, SUPABASE_URL, PUBLISHABLE_KEY, SECRET_KEYS = refresh_supabase_cr
 
 print(
     f"[scraper] Config at import: PROJECT_ID_URL={'set' if PROJECT_ID_URL else 'MISSING'}, "
-    f"URL={SUPABASE_URL or '(missing)'}, "
+    f"URL={mask_supabase_url(SUPABASE_URL)}, "
     f"PUBLISHABLE_KEY={'set' if PUBLISHABLE_KEY else 'MISSING'}, "
     f"SECRET_KEYS={'set' if SECRET_KEYS else 'MISSING'} "
     f"(secret_len={len(SECRET_KEYS)})",
@@ -415,7 +498,7 @@ def get_supabase_admin() -> Client:
     _pid, url, _pub, secret = refresh_supabase_credentials()
     url, secret = _require_url_and_key(url, secret, key_name="SECRET_KEYS")
     print(
-        f"[scraper] Connecting to Supabase at: {url} "
+        f"[scraper] Connecting to Supabase at: {mask_supabase_url(url)} "
         f"(supabase-py create_client + SECRET_KEYS, key_len={len(secret)})",
         flush=True,
     )
@@ -423,15 +506,24 @@ def get_supabase_admin() -> Client:
 
 
 def check_url_reachable(url: str, *, timeout: float = 15.0) -> None:
-    """DNS + HTTPS reachability check for the constructed Supabase URL."""
-    host = urlparse(url).netloc
-    if not host:
-        raise CredentialError(f"invalid Supabase URL (no host): {url!r}")
+    """DNS + HTTPS reachability check for the resolved Supabase URL."""
+    masked = mask_supabase_url(url)
+    host = urlparse(url).netloc.lower()
+    if not host or not host.endswith(".supabase.co"):
+        raise CredentialError(
+            f"invalid resolved Supabase URL (expected *.supabase.co): {masked}"
+        )
+    _log(f"[preflight] DNS check host={host} (masked URL={masked})")
     try:
-        socket.getaddrinfo(host, 443)
+        addrs = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+        _log(
+            f"[preflight] DNS OK — {host} resolved "
+            f"({len(addrs)} address record(s))"
+        )
     except OSError as e:
         raise CredentialError(
-            f"Supabase host {host!r} does not resolve (DNS): {e}"
+            f"Supabase host {host!r} does not resolve (DNS): {e}. "
+            f"Resolved URL was {masked}. Check PROJECT_ID_URL."
         ) from e
     # Lightweight GET — 401/404 still prove the host is reachable.
     probe = f"{url.rstrip('/')}/rest/v1/"
@@ -442,15 +534,19 @@ def check_url_reachable(url: str, *, timeout: float = 15.0) -> None:
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            _log(f"[preflight] URL reachable: {probe} → HTTP {resp.status}")
+            _log(
+                f"[preflight] HTTPS OK — {mask_supabase_url(probe)} "
+                f"→ HTTP {resp.status}"
+            )
     except urllib.error.HTTPError as err:
         _log(
-            f"[preflight] URL reachable: {probe} → HTTP {err.code} "
-            "(expected without auth; host is up)"
+            f"[preflight] HTTPS OK — {mask_supabase_url(probe)} "
+            f"→ HTTP {err.code} (expected without auth; host is up)"
         )
     except Exception as e:
         raise CredentialError(
-            f"Supabase URL not reachable at {probe}: {type(e).__name__}: {e}"
+            f"Supabase URL not reachable at {masked}/rest/v1/: "
+            f"{type(e).__name__}: {e}"
         ) from e
 
 
@@ -473,11 +569,19 @@ def preflight_check() -> Client:
     Verbose config + health check before Playwright / DB writes.
     Prints presence of secrets (never values) and validates URL reachability.
     """
+    raw_env = os.environ.get("PROJECT_ID_URL")
+    cleaned_raw = _clean_project_id_url_raw(raw_env)
     project_id, url, publishable, secret = refresh_supabase_credentials()
     _log("========== PREFLIGHT ==========")
-    _log(f"PROJECT_ID_URL:    {'configured' if project_id else 'MISSING'}"
-         + (f" ({project_id})" if project_id else ""))
-    _log(f"SUPABASE_URL:      {url or 'MISSING (build from PROJECT_ID_URL)'}")
+    _log(
+        f"PROJECT_ID_URL raw: {'set' if (raw_env or '').strip() else 'MISSING'} "
+        f"(cleaned_len={len(cleaned_raw)})"
+    )
+    _log(
+        f"PROJECT_ID_URL ref: {'configured' if project_id else 'MISSING'}"
+        + (f" ({project_id[:4]}****{project_id[-4:]})" if len(project_id) > 8 else "")
+    )
+    _log(f"Resolved SUPABASE_URL (masked): {mask_supabase_url(url)}")
     _log(
         f"PUBLISHABLE_KEY:   {'configured' if publishable else 'MISSING'} "
         f"(len={len(publishable)})"
@@ -493,8 +597,8 @@ def preflight_check() -> Client:
 
     if not project_id or not url:
         raise CredentialError(
-            "missing PROJECT_ID_URL — required to build "
-            "https://{PROJECT_ID_URL}.supabase.co"
+            "missing or unparseable PROJECT_ID_URL — expected a project ref "
+            "or https://{ref}.supabase.co"
         )
     if not secret:
         raise CredentialError(
@@ -509,6 +613,7 @@ def preflight_check() -> Client:
     check_url_reachable(url)
     db = probe_supabase()
     _log("[preflight] SECRET_KEYS auth probe OK (jobs select limit 1)")
+    _log(f"[preflight] Using Supabase at {mask_supabase_url(url)}")
     _log("========== PREFLIGHT OK ==========")
     return db
 
@@ -1078,7 +1183,10 @@ def main() -> int:
             ),
         )
         _log("[db] Upserting into Supabase…")
-        print(f"[scraper] Connecting to Supabase at: {SUPABASE_URL}", flush=True)
+        print(
+            f"[scraper] Connecting to Supabase at: {mask_supabase_url(SUPABASE_URL)}",
+            flush=True,
+        )
         try:
             result = insert_jobs(priority, client=db)
         except ExistingKeysFetchError as e:
