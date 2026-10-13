@@ -24,10 +24,9 @@ jobs:
         working-directory: scrapers
 
     env:
-      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-      NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
-      SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
-      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      PROJECT_ID: ${{ secrets.PROJECT_ID }}
+      PUBLISHABLE_KEY: ${{ secrets.PUBLISHABLE_KEY }}
+      SECRET_KEY: ${{ secrets.SECRET_KEY }}
       SCRAPER_TARGET_MIN: ${{ vars.SCRAPER_TARGET_MIN || '120' }}
       SCRAPER_SUPPORT_MIN: ${{ vars.SCRAPER_SUPPORT_MIN || '30' }}
       SCRAPER_SALES_MIN: ${{ vars.SCRAPER_SALES_MIN || '30' }}
@@ -61,72 +60,59 @@ jobs:
 
       - name: Verify Supabase environment
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
-          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          PROJECT_ID: ${{ secrets.PROJECT_ID }}
+          PUBLISHABLE_KEY: ${{ secrets.PUBLISHABLE_KEY }}
+          SECRET_KEY: ${{ secrets.SECRET_KEY }}
         run: |
           set -euo pipefail
 
-          if [ -z "${SUPABASE_SECRET_KEY:-}" ] && [ -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ]; then
-            export SUPABASE_SECRET_KEY="${SUPABASE_SERVICE_ROLE_KEY}"
-          fi
+          PROJECT_ID="$(echo "${PROJECT_ID:-}" | sed -e 's/^[[:space:]\"'\'']*//' -e 's/[[:space:]\"'\'']*$//')"
+          PUBLISHABLE_KEY="$(echo "${PUBLISHABLE_KEY:-}" | sed -e 's/^[[:space:]\"'\'']*//' -e 's/[[:space:]\"'\'']*$//')"
+          SECRET_KEY="$(echo "${SECRET_KEY:-}" | sed -e 's/^[[:space:]\"'\'']*//' -e 's/[[:space:]\"'\'']*$//')"
 
-          URL="${SUPABASE_URL:-${NEXT_PUBLIC_SUPABASE_URL:-}}"
-          URL="$(echo "$URL" | sed -e 's/^[[:space:]\"'\'']*//' -e 's/[[:space:]\"'\'']*$//')"
-          KEY="${SUPABASE_SECRET_KEY:-}"
-
-          if [ -z "$URL" ]; then
-            echo "::error::SUPABASE_URL (or NEXT_PUBLIC_SUPABASE_URL) secret is required — no hardcoded fallback"
+          if [ -z "$PROJECT_ID" ]; then
+            echo "::error::PROJECT_ID secret is required (builds https://{PROJECT_ID}.supabase.co)"
             exit 1
           fi
-          if [ -z "$KEY" ]; then
-            echo "::error::SUPABASE_SECRET_KEY (or SUPABASE_SERVICE_ROLE_KEY) secret is required"
+          if [ -z "$SECRET_KEY" ]; then
+            echo "::error::SECRET_KEY secret is required for database writes"
             exit 1
           fi
-
-          if ! echo "$URL" | grep -Eqi '^https?://'; then
-            URL="https://${URL#/}"
-            echo "[scraper-ci] SUPABASE_URL missing protocol — forced https://"
+          if [ -z "$PUBLISHABLE_KEY" ]; then
+            echo "::warning::PUBLISHABLE_KEY secret is empty (optional for server-side scraper writes)"
           fi
-          if echo "$URL" | grep -Eqi '^http://'; then
-            URL="https://${URL#http://}"
-            echo "[scraper-ci] SUPABASE_URL upgraded http → https"
-          fi
-          URL="${URL%/}"
 
-          HOST="$(echo "$URL" | sed -E 's#https?://([^/]+).*#\1#')"
-          case "$HOST" in
-            ujhsltihinwuysikzvhs.supabase.co)
-              URL="https://ujhsltlhlnwuysikzvhs.supabase.co"
-              echo "::warning::Typo host ${HOST} — rewriting to ${URL} (update the SUPABASE_URL secret)"
-              HOST="ujhsltlhlnwuysikzvhs.supabase.co"
-              ;;
-            ujhsltlhinwuysikzvhs.supabase.co)
-              URL="https://ujhsltlhlnwuysikzvhs.supabase.co"
-              echo "::warning::Typo host ${HOST} — rewriting to ${URL} (update the SUPABASE_URL secret)"
-              HOST="ujhsltlhlnwuysikzvhs.supabase.co"
+          # Accept bare ref or accidental full host/URL in PROJECT_ID
+          case "$PROJECT_ID" in
+            https://*|http://*)
+              PROJECT_ID="$(echo "$PROJECT_ID" | sed -E 's#https?://([^/]+).*#\1#')"
               ;;
           esac
+          PROJECT_ID="${PROJECT_ID%.supabase.co}"
+
+          URL="https://${PROJECT_ID}.supabase.co"
+          HOST="${PROJECT_ID}.supabase.co"
 
           if ! getent hosts "$HOST" >/dev/null 2>&1; then
-            echo "::error::Supabase host ${HOST} does not resolve (DNS). Fix SUPABASE_URL — no silent fallback."
+            echo "::error::Supabase host ${HOST} does not resolve (DNS). Check PROJECT_ID=${PROJECT_ID}"
             exit 1
           fi
 
-          echo "[scraper-ci] SUPABASE_SECRET_KEY set: yes"
-          echo "[scraper-ci] Effective SUPABASE_URL: ${URL}"
-          echo "[scraper-ci] Supabase host resolves OK: ${HOST}"
+          echo "[scraper-ci] PROJECT_ID: ${PROJECT_ID}"
+          echo "[scraper-ci] SUPABASE_URL: ${URL}"
+          echo "[scraper-ci] PUBLISHABLE_KEY set: $([ -n "$PUBLISHABLE_KEY" ] && echo yes || echo no)"
+          echo "[scraper-ci] SECRET_KEY set: yes"
+          echo "[scraper-ci] Supabase host resolves OK"
 
           {
-            echo "SUPABASE_URL=${URL}"
-            echo "NEXT_PUBLIC_SUPABASE_URL=${URL}"
+            echo "PROJECT_ID=${PROJECT_ID}"
           } >> "$GITHUB_ENV"
 
       - name: Run scrapers
         env:
-          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          PROJECT_ID: ${{ secrets.PROJECT_ID }}
+          PUBLISHABLE_KEY: ${{ secrets.PUBLISHABLE_KEY }}
+          SECRET_KEY: ${{ secrets.SECRET_KEY }}
           SCRAPER_TARGET_MIN: ${{ vars.SCRAPER_TARGET_MIN || '120' }}
           SCRAPER_SUPPORT_MIN: ${{ vars.SCRAPER_SUPPORT_MIN || '30' }}
           SCRAPER_SALES_MIN: ${{ vars.SCRAPER_SALES_MIN || '30' }}
@@ -135,20 +121,25 @@ jobs:
           set -euo pipefail
           echo "[scraper-ci] Starting scrape_jobs.py from $(pwd)"
 
-          if [ -z "${SUPABASE_SECRET_KEY:-}" ] && [ -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ]; then
-            export SUPABASE_SECRET_KEY="${SUPABASE_SERVICE_ROLE_KEY}"
-          fi
-
-          if [ -z "${SUPABASE_URL:-}" ]; then
-            echo "::error::SUPABASE_URL missing after verify step"
+          if [ -z "${PROJECT_ID:-}" ]; then
+            echo "::error::PROJECT_ID is required"
             exit 1
           fi
-          if [ -z "${SUPABASE_SECRET_KEY:-}" ]; then
-            echo "::error::SUPABASE_SECRET_KEY (or SUPABASE_SERVICE_ROLE_KEY) is required"
+          if [ -z "${SECRET_KEY:-}" ]; then
+            echo "::error::SECRET_KEY is required"
             exit 1
           fi
 
-          echo "[scraper-ci] Connecting to Supabase at: ${SUPABASE_URL}"
+          # Normalize PROJECT_ID the same way as the verify step
+          case "$PROJECT_ID" in
+            https://*|http://*)
+              export PROJECT_ID="$(echo "$PROJECT_ID" | sed -E 's#https?://([^/]+).*#\1#')"
+              ;;
+          esac
+          export PROJECT_ID="${PROJECT_ID%.supabase.co}"
+
+          echo "[scraper-ci] PROJECT_ID=${PROJECT_ID}"
+          echo "[scraper-ci] URL=https://${PROJECT_ID}.supabase.co"
           echo "[scraper-ci] Volume floors TARGET=${SCRAPER_TARGET_MIN} SUPPORT=${SCRAPER_SUPPORT_MIN} SALES=${SCRAPER_SALES_MIN}"
           python scrape_jobs.py
           code=$?

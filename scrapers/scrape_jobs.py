@@ -12,8 +12,12 @@ import hashlib
 import os
 import random
 import re
+import socket
 import sys
 import time
+import traceback
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,59 +32,67 @@ ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
 load_dotenv(ROOT.parent / ".env.local")
 
-# Known typo hosts from older secrets → explicit correction (never used as empty-URL fallback).
-_TYPO_HOST_REWRITES = {
-    "ujhsltihinwuysikzvhs.supabase.co": "https://ujhsltlhlnwuysikzvhs.supabase.co",
-    "ujhsltlhinwuysikzvhs.supabase.co": "https://ujhsltlhlnwuysikzvhs.supabase.co",
-}
-
 # HTTP statuses that warrant exponential backoff retries while scraping.
 _RETRYABLE_HTTP = frozenset({429, 503})
 _FETCH_MAX_RETRIES = 3
 _FETCH_BASE_DELAY_SEC = 1.5
 
 
-def _sanitize_url(raw: str | None) -> str:
-    """Normalize a Supabase URL. Returns '' if missing — never invents a project host."""
+def _env_str(name: str) -> str:
+    """Non-empty stripped env value, or ''."""
+    value = os.environ.get(name)
+    if value is None or not str(value).strip():
+        return ""
+    return str(value).strip().strip("'").strip('"')
+
+
+def _normalize_project_id(raw: str) -> str:
+    """Accept bare project ref or a full *.supabase.co host/URL."""
     value = (raw or "").strip().strip("'").strip('"')
     if not value:
         return ""
-    if not re.match(r"^https?://", value, flags=re.I):
-        value = "https://" + value.lstrip("/")
-    if value.lower().startswith("http://"):
-        value = "https://" + value[7:]
-    value = value.rstrip("/")
-    host = urlparse(value).netloc.lower()
-    if host in _TYPO_HOST_REWRITES:
-        corrected = _TYPO_HOST_REWRITES[host].rstrip("/")
-        print(
-            f"[scraper] WARNING: typo Supabase host {host!r} — "
-            f"rewriting to {corrected} (fix the SUPABASE_URL secret)",
-            flush=True,
-        )
-        return corrected
+    # If a full URL/host was pasted, extract the project ref.
+    if "://" in value or "." in value:
+        host = urlparse(
+            value if "://" in value else f"https://{value}"
+        ).netloc.lower()
+        if host.endswith(".supabase.co"):
+            return host[: -len(".supabase.co")]
     return value
 
 
-def _env_first(*names: str) -> str:
-    """First non-empty stripped env value among names."""
-    for name in names:
-        value = os.environ.get(name)
-        if value is not None and str(value).strip():
-            return str(value).strip()
-    return ""
+def build_supabase_url(project_id: str | None = None) -> str:
+    """Construct https://{PROJECT_ID}.supabase.co from PROJECT_ID."""
+    pid = _normalize_project_id(
+        project_id if project_id is not None else _env_str("PROJECT_ID")
+    )
+    if not pid:
+        return ""
+    return f"https://{pid}.supabase.co"
 
 
-# URL + key resolution at import (empty until env/secrets are present).
-# SECRET_KEY: server-side Python SDK inserts only (never send with a browser UA).
-SUPABASE_URL = _sanitize_url(
-    _env_first("SUPABASE_URL", "NEXT_PUBLIC_SUPABASE_URL") or None
-)
-SECRET_KEY = _env_first("SUPABASE_SECRET_KEY", "SUPABASE_SERVICE_ROLE_KEY")
+def refresh_supabase_credentials() -> tuple[str, str, str, str]:
+    """
+    Re-read GitHub Secrets–aligned env vars.
+    Returns (project_id, supabase_url, publishable_key, secret_key).
+    """
+    global PROJECT_ID, SUPABASE_URL, PUBLISHABLE_KEY, SECRET_KEY
+    PROJECT_ID = _normalize_project_id(_env_str("PROJECT_ID"))
+    SUPABASE_URL = build_supabase_url(PROJECT_ID)
+    PUBLISHABLE_KEY = _env_str("PUBLISHABLE_KEY")
+    SECRET_KEY = _env_str("SECRET_KEY")
+    return PROJECT_ID, SUPABASE_URL, PUBLISHABLE_KEY, SECRET_KEY
+
+
+# Resolved at import; refresh_supabase_credentials() re-reads before use.
+PROJECT_ID, SUPABASE_URL, PUBLISHABLE_KEY, SECRET_KEY = refresh_supabase_credentials()
 
 print(
-    f"[scraper] Supabase Client Initialized: URL={SUPABASE_URL or '(missing)'}, "
-    f"Secret Present={bool(SECRET_KEY)} (secret_len={len(SECRET_KEY)})",
+    f"[scraper] Config at import: PROJECT_ID={'set' if PROJECT_ID else 'MISSING'}, "
+    f"URL={SUPABASE_URL or '(missing)'}, "
+    f"PUBLISHABLE_KEY={'set' if PUBLISHABLE_KEY else 'MISSING'}, "
+    f"SECRET_KEY={'set' if SECRET_KEY else 'MISSING'} "
+    f"(secret_len={len(SECRET_KEY)})",
     flush=True,
 )
 
@@ -378,33 +390,19 @@ BROWSER_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-def refresh_supabase_credentials() -> tuple[str, str]:
-    """Re-read env so late-exported CI vars are picked up. Returns (url, secret)."""
-    global SUPABASE_URL, SECRET_KEY
-    SUPABASE_URL = _sanitize_url(
-        _env_first("SUPABASE_URL", "NEXT_PUBLIC_SUPABASE_URL") or None
-    )
-    # Prefer SUPABASE_SECRET_KEY; allow legacy service_role secret name in CI.
-    SECRET_KEY = _env_first("SUPABASE_SECRET_KEY", "SUPABASE_SERVICE_ROLE_KEY")
-    return SUPABASE_URL, SECRET_KEY
-
-
 def _require_url_and_key(url: str, key: str, *, key_name: str) -> tuple[str, str]:
     """Ensure create_client gets two real non-empty strings."""
     url_s = (url or "").strip()
     key_s = (key or "").strip()
     if not url_s:
         raise ValueError(
-            "SUPABASE_URL is empty — set SUPABASE_URL or NEXT_PUBLIC_SUPABASE_URL"
+            "Supabase URL is empty — set PROJECT_ID "
+            "(URL is built as https://{PROJECT_ID}.supabase.co)"
         )
     if not key_s:
         raise ValueError(
             f"{key_name} is empty — cannot create Supabase client "
             "(expected a non-empty string)"
-        )
-    if not isinstance(url_s, str) or not isinstance(key_s, str):
-        raise TypeError(
-            f"create_client requires str url/key, got {type(url_s)!r} / {type(key_s)!r}"
         )
     return url_s, key_s
 
@@ -414,26 +412,50 @@ def get_supabase_admin() -> Client:
     Server-side Supabase client for DB reads/writes.
     Uses SECRET_KEY only via supabase-py (httpx) — never Playwright / browser fetch.
     """
-    url, secret = refresh_supabase_credentials()
-    url, secret = _require_url_and_key(
-        url, secret, key_name="SUPABASE_SECRET_KEY"
-    )
+    _pid, url, _pub, secret = refresh_supabase_credentials()
+    url, secret = _require_url_and_key(url, secret, key_name="SECRET_KEY")
     print(
         f"[scraper] Connecting to Supabase at: {url} "
         f"(supabase-py create_client + SECRET_KEY, key_len={len(secret)})",
         flush=True,
     )
-    print(
-        f"[scraper] Supabase Client Initialized: URL={url}, Secret Present={True}",
-        flush=True,
-    )
-    # Keyword args avoid positional mistakes that raise:
-    # Client.__init__() missing 1 required positional argument: 'supabase_key'
     return create_client(supabase_url=url, supabase_key=secret)
 
 
+def check_url_reachable(url: str, *, timeout: float = 15.0) -> None:
+    """DNS + HTTPS reachability check for the constructed Supabase URL."""
+    host = urlparse(url).netloc
+    if not host:
+        raise CredentialError(f"invalid Supabase URL (no host): {url!r}")
+    try:
+        socket.getaddrinfo(host, 443)
+    except OSError as e:
+        raise CredentialError(
+            f"Supabase host {host!r} does not resolve (DNS): {e}"
+        ) from e
+    # Lightweight GET — 401/404 still prove the host is reachable.
+    probe = f"{url.rstrip('/')}/rest/v1/"
+    req = urllib.request.Request(
+        probe,
+        method="GET",
+        headers={"User-Agent": "remote-ready-hq-scraper/preflight"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            _log(f"[preflight] URL reachable: {probe} → HTTP {resp.status}")
+    except urllib.error.HTTPError as err:
+        _log(
+            f"[preflight] URL reachable: {probe} → HTTP {err.code} "
+            "(expected without auth; host is up)"
+        )
+    except Exception as e:
+        raise CredentialError(
+            f"Supabase URL not reachable at {probe}: {type(e).__name__}: {e}"
+        ) from e
+
+
 def probe_supabase(client: Client | None = None) -> Client:
-    """Validate credentials with a lightweight authenticated read. Raises CredentialError."""
+    """Validate SECRET_KEY with a lightweight authenticated read."""
     try:
         db = client or get_supabase_admin()
         db.table("jobs").select("apply_url").limit(1).execute()
@@ -444,6 +466,51 @@ def probe_supabase(client: Client | None = None) -> Client:
         raise CredentialError(
             f"Supabase credential/probe failed: {type(e).__name__}: {e}"
         ) from e
+
+
+def preflight_check() -> Client:
+    """
+    Verbose config + health check before Playwright / DB writes.
+    Prints presence of secrets (never values) and validates URL reachability.
+    """
+    project_id, url, publishable, secret = refresh_supabase_credentials()
+    _log("========== PREFLIGHT ==========")
+    _log(f"PROJECT_ID:        {'configured' if project_id else 'MISSING'}"
+         + (f" ({project_id})" if project_id else ""))
+    _log(f"SUPABASE_URL:      {url or 'MISSING (build from PROJECT_ID)'}")
+    _log(
+        f"PUBLISHABLE_KEY:   {'configured' if publishable else 'MISSING'} "
+        f"(len={len(publishable)})"
+    )
+    _log(
+        f"SECRET_KEY:        {'configured' if secret else 'MISSING'} "
+        f"(len={len(secret)})"
+    )
+    _log(
+        f"Volume floors:     TARGET={TARGET_MIN} "
+        f"SUPPORT={SUPPORT_MIN} SALES={SALES_MIN}"
+    )
+
+    if not project_id or not url:
+        raise CredentialError(
+            "missing PROJECT_ID — required to build "
+            "https://{PROJECT_ID}.supabase.co"
+        )
+    if not secret:
+        raise CredentialError(
+            "missing SECRET_KEY — required for database writes"
+        )
+    if not publishable:
+        _log(
+            "[preflight] WARNING: PUBLISHABLE_KEY missing "
+            "(not required for server writes; set GitHub secret if needed)"
+        )
+
+    check_url_reachable(url)
+    db = probe_supabase()
+    _log("[preflight] SECRET_KEY auth probe OK (jobs select limit 1)")
+    _log("========== PREFLIGHT OK ==========")
+    return db
 
 
 def make_listing(
@@ -952,55 +1019,36 @@ def print_run_summary(stats: RunStats) -> None:
     print("\n".join(lines), flush=True)
 
 
+def _fail(stats: RunStats, message: str, exc: BaseException | None = None) -> int:
+    """Log failure with optional stack trace, print summary, return exit code 1."""
+    stats.critical_error = message
+    _log_err(f"[scraper] FAILED: {message}")
+    if exc is not None:
+        traceback.print_exception(type(exc), exc, exc.__traceback__)
+    print_run_summary(stats)
+    return 1
+
+
 def main() -> int:
     """
-    Fail closed: non-zero exit on credential failure, existing-key fetch failure,
-    insert/upsert failures, volume floor misses, or other critical errors.
+    Exit 0 on success. On failure: detailed stack traces + RUN SUMMARY, exit 1.
     """
     stats = RunStats()
     _log(f"[scraper] RemoteReady HQ scraper — {datetime.now(timezone.utc).isoformat()}")
     _log(f"[scraper] cwd={Path.cwd()} script={Path(__file__).resolve()}")
-    _log(
-        f"[scraper] Volume floors: TARGET_MIN={TARGET_MIN} "
-        f"SUPPORT_MIN={SUPPORT_MIN} SALES_MIN={SALES_MIN}"
-    )
-
-    url, secret = refresh_supabase_credentials()
-    print(
-        f"[scraper] Supabase Client Initialized: URL={url or '(missing)'}, "
-        f"Secret Present={bool(secret)} (secret_len={len(secret)})",
-        flush=True,
-    )
 
     db: Client | None = None
     try:
-        if not url:
-            raise CredentialError(
-                "missing SUPABASE_URL (or NEXT_PUBLIC_SUPABASE_URL) — "
-                "required; no hardcoded project fallback"
-            )
-        if not secret:
-            raise CredentialError(
-                "missing SUPABASE_SECRET_KEY (or SUPABASE_SERVICE_ROLE_KEY) — "
-                "cannot write to the database"
-            )
-        db = probe_supabase()
-        _log("[scraper] create_client + credential probe OK")
+        db = preflight_check()
     except Exception as e:
-        stats.critical_error = str(e)
-        _log_err(f"[scraper] Credential validation failed: {e}")
-        print_run_summary(stats)
-        return 1
+        return _fail(stats, f"preflight failed: {e}", e)
 
     try:
         _log("[scraper] Starting scrape_all()…")
         try:
             scraped = scrape_all()
         except Exception as e:
-            stats.critical_error = f"scrape_all failed: {e}"
-            _log_err(f"[scraper] {stats.critical_error}")
-            print_run_summary(stats)
-            return 1
+            return _fail(stats, f"scrape_all failed: {e}", e)
 
         stats.fetched = len(scraped)
         unique = deduplicate(scraped)
@@ -1012,17 +1060,13 @@ def main() -> int:
         _log(f"[scraper] Category mix: {breakdown}")
 
         if not unique:
-            stats.critical_error = "no jobs scraped from any source this run"
-            _log_err(f"[scraper] {stats.critical_error}")
-            print_run_summary(stats)
-            return 1
+            return _fail(stats, "no jobs scraped from any source this run")
 
-        # Volume floors: warn loudly; fail the run after writes so data is not discarded.
+        # Volume floors: warn loudly; fail after writes so data is not discarded.
         floor_issues = check_volume_floors(unique)
         if floor_issues:
             stats.volume_warnings = floor_issues
             for issue in floor_issues:
-                # GitHub Actions annotation + scraper log
                 print(f"::warning::Volume floor missed — {issue}", flush=True)
                 _log_err(f"[scraper] VOLUME WARNING: {issue}")
 
@@ -1038,15 +1082,9 @@ def main() -> int:
         try:
             result = insert_jobs(priority, client=db)
         except ExistingKeysFetchError as e:
-            stats.critical_error = str(e)
-            _log_err(f"[db] {stats.critical_error}")
-            print_run_summary(stats)
-            return 1
+            return _fail(stats, str(e), e)
         except Exception as e:
-            stats.critical_error = f"database write failed: {e}"
-            _log_err(f"[db] {stats.critical_error}")
-            print_run_summary(stats)
-            return 1
+            return _fail(stats, f"database write failed: {e}", e)
 
         stats.inserted = result.inserted
         stats.skipped = result.skipped
@@ -1058,33 +1096,23 @@ def main() -> int:
         )
 
         if result.failed > 0:
-            stats.critical_error = (
-                f"{result.failed} job row(s) failed during upsert"
+            return _fail(
+                stats, f"{result.failed} job row(s) failed during upsert"
             )
-            print_run_summary(stats)
-            return 1
 
-        # Fresh jobs existed after DB dedupe but nothing landed — treat as failure.
         fresh_expected = stats.deduplicated - stats.skipped
         if fresh_expected > 0 and stats.inserted == 0:
-            stats.critical_error = (
-                f"{fresh_expected} new job(s) expected but inserted=0"
+            return _fail(
+                stats, f"{fresh_expected} new job(s) expected but inserted=0"
             )
-            print_run_summary(stats)
-            return 1
 
         if floor_issues:
-            stats.critical_error = (
-                "volume floor(s) not met: " + "; ".join(floor_issues)
+            return _fail(
+                stats, "volume floor(s) not met: " + "; ".join(floor_issues)
             )
-            print_run_summary(stats)
-            return 1
 
     except Exception as e:
-        stats.critical_error = f"critical error: {e}"
-        _log_err(f"[scraper] {stats.critical_error}")
-        print_run_summary(stats)
-        return 1
+        return _fail(stats, f"critical error: {e}", e)
 
     print_run_summary(stats)
     print(f"Scrape completed. Inserted {stats.inserted} new jobs.", flush=True)
@@ -1098,7 +1126,6 @@ if __name__ == "__main__":
         raise
     except Exception as e:
         print(f"[scraper] Fatal: {e}", flush=True)
-        print_run_summary(
-            RunStats(critical_error=str(e), failed=0)
-        )
+        traceback.print_exc()
+        print_run_summary(RunStats(critical_error=str(e), failed=0))
         raise SystemExit(1) from e
