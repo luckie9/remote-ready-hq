@@ -62,9 +62,9 @@ def _normalize_project_id(raw: str) -> str:
 
 
 def build_supabase_url(project_id: str | None = None) -> str:
-    """Construct https://{PROJECT_ID}.supabase.co from PROJECT_ID."""
+    """Construct https://{PROJECT_ID_URL}.supabase.co from PROJECT_ID_URL."""
     pid = _normalize_project_id(
-        project_id if project_id is not None else _env_str("PROJECT_ID")
+        project_id if project_id is not None else _env_str("PROJECT_ID_URL")
     )
     if not pid:
         return ""
@@ -74,25 +74,25 @@ def build_supabase_url(project_id: str | None = None) -> str:
 def refresh_supabase_credentials() -> tuple[str, str, str, str]:
     """
     Re-read GitHub Secrets–aligned env vars.
-    Returns (project_id, supabase_url, publishable_key, secret_key).
+    Returns (project_id_url, supabase_url, publishable_key, secret_keys).
     """
-    global PROJECT_ID, SUPABASE_URL, PUBLISHABLE_KEY, SECRET_KEY
-    PROJECT_ID = _normalize_project_id(_env_str("PROJECT_ID"))
-    SUPABASE_URL = build_supabase_url(PROJECT_ID)
+    global PROJECT_ID_URL, SUPABASE_URL, PUBLISHABLE_KEY, SECRET_KEYS
+    PROJECT_ID_URL = _normalize_project_id(_env_str("PROJECT_ID_URL"))
+    SUPABASE_URL = build_supabase_url(PROJECT_ID_URL)
     PUBLISHABLE_KEY = _env_str("PUBLISHABLE_KEY")
-    SECRET_KEY = _env_str("SECRET_KEY")
-    return PROJECT_ID, SUPABASE_URL, PUBLISHABLE_KEY, SECRET_KEY
+    SECRET_KEYS = _env_str("SECRET_KEYS")
+    return PROJECT_ID_URL, SUPABASE_URL, PUBLISHABLE_KEY, SECRET_KEYS
 
 
 # Resolved at import; refresh_supabase_credentials() re-reads before use.
-PROJECT_ID, SUPABASE_URL, PUBLISHABLE_KEY, SECRET_KEY = refresh_supabase_credentials()
+PROJECT_ID_URL, SUPABASE_URL, PUBLISHABLE_KEY, SECRET_KEYS = refresh_supabase_credentials()
 
 print(
-    f"[scraper] Config at import: PROJECT_ID={'set' if PROJECT_ID else 'MISSING'}, "
+    f"[scraper] Config at import: PROJECT_ID_URL={'set' if PROJECT_ID_URL else 'MISSING'}, "
     f"URL={SUPABASE_URL or '(missing)'}, "
     f"PUBLISHABLE_KEY={'set' if PUBLISHABLE_KEY else 'MISSING'}, "
-    f"SECRET_KEY={'set' if SECRET_KEY else 'MISSING'} "
-    f"(secret_len={len(SECRET_KEY)})",
+    f"SECRET_KEYS={'set' if SECRET_KEYS else 'MISSING'} "
+    f"(secret_len={len(SECRET_KEYS)})",
     flush=True,
 )
 
@@ -396,8 +396,8 @@ def _require_url_and_key(url: str, key: str, *, key_name: str) -> tuple[str, str
     key_s = (key or "").strip()
     if not url_s:
         raise ValueError(
-            "Supabase URL is empty — set PROJECT_ID "
-            "(URL is built as https://{PROJECT_ID}.supabase.co)"
+            "Supabase URL is empty — set PROJECT_ID_URL "
+            "(URL is built as https://{PROJECT_ID_URL}.supabase.co)"
         )
     if not key_s:
         raise ValueError(
@@ -410,13 +410,13 @@ def _require_url_and_key(url: str, key: str, *, key_name: str) -> tuple[str, str
 def get_supabase_admin() -> Client:
     """
     Server-side Supabase client for DB reads/writes.
-    Uses SECRET_KEY only via supabase-py (httpx) — never Playwright / browser fetch.
+    Uses SECRET_KEYS only via supabase-py (httpx) — never Playwright / browser fetch.
     """
     _pid, url, _pub, secret = refresh_supabase_credentials()
-    url, secret = _require_url_and_key(url, secret, key_name="SECRET_KEY")
+    url, secret = _require_url_and_key(url, secret, key_name="SECRET_KEYS")
     print(
         f"[scraper] Connecting to Supabase at: {url} "
-        f"(supabase-py create_client + SECRET_KEY, key_len={len(secret)})",
+        f"(supabase-py create_client + SECRET_KEYS, key_len={len(secret)})",
         flush=True,
     )
     return create_client(supabase_url=url, supabase_key=secret)
@@ -455,7 +455,7 @@ def check_url_reachable(url: str, *, timeout: float = 15.0) -> None:
 
 
 def probe_supabase(client: Client | None = None) -> Client:
-    """Validate SECRET_KEY with a lightweight authenticated read."""
+    """Validate SECRET_KEYS with a lightweight authenticated read."""
     try:
         db = client or get_supabase_admin()
         db.table("jobs").select("apply_url").limit(1).execute()
@@ -475,15 +475,15 @@ def preflight_check() -> Client:
     """
     project_id, url, publishable, secret = refresh_supabase_credentials()
     _log("========== PREFLIGHT ==========")
-    _log(f"PROJECT_ID:        {'configured' if project_id else 'MISSING'}"
+    _log(f"PROJECT_ID_URL:    {'configured' if project_id else 'MISSING'}"
          + (f" ({project_id})" if project_id else ""))
-    _log(f"SUPABASE_URL:      {url or 'MISSING (build from PROJECT_ID)'}")
+    _log(f"SUPABASE_URL:      {url or 'MISSING (build from PROJECT_ID_URL)'}")
     _log(
         f"PUBLISHABLE_KEY:   {'configured' if publishable else 'MISSING'} "
         f"(len={len(publishable)})"
     )
     _log(
-        f"SECRET_KEY:        {'configured' if secret else 'MISSING'} "
+        f"SECRET_KEYS:       {'configured' if secret else 'MISSING'} "
         f"(len={len(secret)})"
     )
     _log(
@@ -493,12 +493,12 @@ def preflight_check() -> Client:
 
     if not project_id or not url:
         raise CredentialError(
-            "missing PROJECT_ID — required to build "
-            "https://{PROJECT_ID}.supabase.co"
+            "missing PROJECT_ID_URL — required to build "
+            "https://{PROJECT_ID_URL}.supabase.co"
         )
     if not secret:
         raise CredentialError(
-            "missing SECRET_KEY — required for database writes"
+            "missing SECRET_KEYS — required for database writes"
         )
     if not publishable:
         _log(
@@ -508,7 +508,7 @@ def preflight_check() -> Client:
 
     check_url_reachable(url)
     db = probe_supabase()
-    _log("[preflight] SECRET_KEY auth probe OK (jobs select limit 1)")
+    _log("[preflight] SECRET_KEYS auth probe OK (jobs select limit 1)")
     _log("========== PREFLIGHT OK ==========")
     return db
 
@@ -901,7 +901,7 @@ def fetch_existing_keys(client: Client) -> set[str]:
 
 
 def count_jobs(client: Client | None = None) -> int:
-    """Count jobs via supabase-py (SECRET_KEY) — never browser User-Agent."""
+    """Count jobs via supabase-py (SECRET_KEYS) — never browser User-Agent."""
     try:
         db = client or get_supabase_admin()
         resp = db.table("jobs").select("id", count="exact").limit(1).execute()
@@ -928,7 +928,7 @@ def to_row(job: JobListing) -> dict:
 
 def insert_jobs(jobs: list[JobListing], client: Client | None = None) -> WriteResult:
     """
-    Upsert new jobs via supabase-py + SECRET_KEY only.
+    Upsert new jobs via supabase-py + SECRET_KEYS only.
     Aborts (raises) if existing-key fetch fails — never treats that as empty DB.
     Uses ignore_duplicates as a race-safe safety net on unique apply_url conflicts.
     """

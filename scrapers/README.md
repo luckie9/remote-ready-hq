@@ -16,8 +16,8 @@ Credentials (from `scrapers/.env`, root `.env.local`, or GitHub Secrets):
 
 | Variable | Required | Purpose |
 |---|---|---|
-| `PROJECT_ID` | yes | Builds `https://{PROJECT_ID}.supabase.co` |
-| `SECRET_KEY` | yes | Server-side supabase-py writes |
+| `PROJECT_ID_URL` | yes | Builds `https://{PROJECT_ID_URL}.supabase.co` |
+| `SECRET_KEYS` | yes | Server-side supabase-py writes |
 | `PUBLISHABLE_KEY` | optional | Logged in preflight; not used for inserts |
 
 Optional volume floors (fail the run if missed after dedupe):
@@ -34,7 +34,7 @@ python scrape_jobs.py
 
 ## Behavior
 
-1. Preflight: print config status (no secret values), DNS/HTTPS reachability, `SECRET_KEY` auth probe
+1. Preflight: print config status (no secret values), DNS/HTTPS reachability, `SECRET_KEYS` auth probe
 2. Fetch Jobicy / Remotive / RemoteOK / Arbeitnow (retries HTTP 429/503 with backoff)
 3. Normalize apply URLs, dedupe, upsert with `ignore_duplicates`
 4. Enforce volume floors; print RUN SUMMARY
