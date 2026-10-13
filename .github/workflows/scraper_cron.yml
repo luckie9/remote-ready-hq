@@ -109,6 +109,8 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Run scrapers
+        # Explicitly re-pass secrets so scrape_jobs.py always sees them
+        # (in addition to the job-level env block above).
         env:
           PROJECT_ID_URL: ${{ secrets.PROJECT_ID_URL }}
           PUBLISHABLE_KEY: ${{ secrets.PUBLISHABLE_KEY }}
@@ -121,12 +123,17 @@ jobs:
           set -euo pipefail
           echo "[scraper-ci] Starting scrape_jobs.py from $(pwd)"
 
+          # Shell-level diagnostics (lengths only — never print secret values)
+          echo "[scraper-ci] ENV DIAG: PROJECT_ID_URL set=$([ -n "${PROJECT_ID_URL+x}" ] && echo True || echo False) non_empty=$([ -n "${PROJECT_ID_URL:-}" ] && echo True || echo False) len=${#PROJECT_ID_URL}"
+          echo "[scraper-ci] ENV DIAG: PUBLISHABLE_KEY set=$([ -n "${PUBLISHABLE_KEY+x}" ] && echo True || echo False) non_empty=$([ -n "${PUBLISHABLE_KEY:-}" ] && echo True || echo False) len=${#PUBLISHABLE_KEY}"
+          echo "[scraper-ci] ENV DIAG: SECRET_KEYS set=$([ -n "${SECRET_KEYS+x}" ] && echo True || echo False) non_empty=$([ -n "${SECRET_KEYS:-}" ] && echo True || echo False) len=${#SECRET_KEYS}"
+
           if [ -z "${PROJECT_ID_URL:-}" ]; then
-            echo "::error::PROJECT_ID_URL is required"
+            echo "::error::PROJECT_ID_URL is empty — check that secrets.PROJECT_ID_URL exists in the repo"
             exit 1
           fi
           if [ -z "${SECRET_KEYS:-}" ]; then
-            echo "::error::SECRET_KEYS is required"
+            echo "::error::SECRET_KEYS is empty — check that secrets.SECRET_KEYS exists in the repo"
             exit 1
           fi
 
@@ -138,9 +145,11 @@ jobs:
           esac
           export PROJECT_ID_URL="${PROJECT_ID_URL%.supabase.co}"
 
-          echo "[scraper-ci] PROJECT_ID_URL=${PROJECT_ID_URL}"
+          echo "[scraper-ci] PROJECT_ID_URL len after normalize=${#PROJECT_ID_URL}"
           echo "[scraper-ci] URL=https://${PROJECT_ID_URL}.supabase.co"
           echo "[scraper-ci] Volume floors TARGET=${SCRAPER_TARGET_MIN} SUPPORT=${SCRAPER_SUPPORT_MIN} SALES=${SCRAPER_SALES_MIN}"
+          # Export explicitly so the Python process inherits them
+          export PROJECT_ID_URL PUBLISHABLE_KEY SECRET_KEYS
           python scrape_jobs.py
           code=$?
           echo "[scraper-ci] scrape_jobs.py finished with exit code ${code}"

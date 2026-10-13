@@ -564,30 +564,76 @@ def probe_supabase(client: Client | None = None) -> Client:
         ) from e
 
 
+def _env_presence_diag(name: str) -> str:
+    """
+    Diagnose a single env var without printing its value.
+    Distinguishes missing key vs present-but-empty (common with GitHub Secrets).
+    """
+    in_environ = name in os.environ
+    raw = os.environ.get(name)
+    if raw is None:
+        return f"{name}: in_os_environ=False non_empty=False len=0"
+    # Keep length of the raw string (including whitespace) for CI debugging
+    raw_len = len(raw)
+    stripped_len = len(raw.strip())
+    non_empty = stripped_len > 0
+    return (
+        f"{name}: in_os_environ={in_environ} non_empty={non_empty} "
+        f"len={raw_len} stripped_len={stripped_len}"
+    )
+
+
 def preflight_check() -> Client:
     """
     Verbose config + health check before Playwright / DB writes.
     Prints presence of secrets (never values) and validates URL reachability.
     """
+    _log("========== PREFLIGHT ==========")
+    _log("[preflight] Environment variable diagnostics (values never printed):")
+    for key in ("PROJECT_ID_URL", "PUBLISHABLE_KEY", "SECRET_KEYS"):
+        _log(f"[preflight]   {_env_presence_diag(key)}")
+
+    # Also show whether any near-miss legacy names leaked into the environment
+    legacy = [
+        k
+        for k in os.environ
+        if k.upper()
+        in {
+            "PROJECT_ID",
+            "SUPABASE_URL",
+            "SUPABASE_SECRET_KEY",
+            "SUPABASE_SERVICE_ROLE_KEY",
+            "SECRET_KEY",
+            "SUPABASE_ANON_KEY",
+        }
+    ]
+    if legacy:
+        _log(
+            "[preflight] WARNING: legacy env keys present (ignored): "
+            + ", ".join(sorted(legacy))
+        )
+    else:
+        _log("[preflight] No legacy Supabase env key names detected")
+
     raw_env = os.environ.get("PROJECT_ID_URL")
     cleaned_raw = _clean_project_id_url_raw(raw_env)
     project_id, url, publishable, secret = refresh_supabase_credentials()
-    _log("========== PREFLIGHT ==========")
     _log(
-        f"PROJECT_ID_URL raw: {'set' if (raw_env or '').strip() else 'MISSING'} "
-        f"(cleaned_len={len(cleaned_raw)})"
-    )
-    _log(
-        f"PROJECT_ID_URL ref: {'configured' if project_id else 'MISSING'}"
-        + (f" ({project_id[:4]}****{project_id[-4:]})" if len(project_id) > 8 else "")
+        f"PROJECT_ID_URL resolved_ref: "
+        f"{'True' if project_id else 'False'}"
+        + (
+            f" (masked={project_id[:4]}****{project_id[-4:]})"
+            if len(project_id) > 8
+            else ""
+        )
     )
     _log(f"Resolved SUPABASE_URL (masked): {mask_supabase_url(url)}")
     _log(
-        f"PUBLISHABLE_KEY:   {'configured' if publishable else 'MISSING'} "
+        f"PUBLISHABLE_KEY usable: {'True' if publishable else 'False'} "
         f"(len={len(publishable)})"
     )
     _log(
-        f"SECRET_KEYS:       {'configured' if secret else 'MISSING'} "
+        f"SECRET_KEYS usable:     {'True' if secret else 'False'} "
         f"(len={len(secret)})"
     )
     _log(
