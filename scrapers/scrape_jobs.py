@@ -46,87 +46,55 @@ def _env_str(name: str) -> str:
     return str(value).strip().strip("'").strip('"')
 
 
-def _clean_project_id_url_raw(raw: str | None) -> str:
+def clean_project_ref(raw: str | None = None) -> str:
     """
-    Strip whitespace, quotes, trailing slashes, and common accidental wrappers
-    from PROJECT_ID_URL before resolution.
+    Parse PROJECT_ID_URL into a raw Supabase project reference only.
+
+    Steps:
+      1. Read os.environ['PROJECT_ID_URL'] (or `raw` if provided) and strip.
+      2. Raise ValueError if empty.
+      3. Strip leading http(s)://, trailing /, and any .supabase.co host suffix
+         so only the bare ref remains (e.g. ujhsltlhlnwuysikzvhs).
     """
-    value = "" if raw is None else str(raw)
-    value = value.strip().strip("'").strip('"').strip("`").strip()
-    # Collapse internal whitespace / newlines from secrets UI paste
-    value = re.sub(r"\s+", "", value)
-    value = value.rstrip("/")
-    # Accidental prefixes from copy-paste
-    for prefix in ("url=", "URL=", "host=", "HOST=", "supabase_url=", "SUPABASE_URL="):
-        if value.lower().startswith(prefix.lower()):
-            value = value[len(prefix) :]
-    value = value.strip().rstrip("/")
-    return value
+    project_ref = (
+        os.environ.get("PROJECT_ID_URL", "") if raw is None else (raw or "")
+    )
+    project_ref = str(project_ref).strip().strip("'").strip('"').strip("`")
+    # Secrets UI sometimes injects newlines / spaces
+    project_ref = re.sub(r"\s+", "", project_ref)
+    if not project_ref:
+        raise ValueError("PROJECT_ID_URL is missing")
+
+    # Remove leading scheme
+    lower = project_ref.lower()
+    if lower.startswith("https://"):
+        project_ref = project_ref[8:]
+    elif lower.startswith("http://"):
+        project_ref = project_ref[7:]
+
+    # Drop path / query / trailing slash (e.g. host/rest/v1/)
+    project_ref = project_ref.split("/")[0].split("?")[0].rstrip("/")
+
+    # Keep only the raw ref if a *.supabase.co host was provided
+    lower = project_ref.lower()
+    if ".supabase.co" in lower:
+        project_ref = project_ref[: lower.find(".supabase.co")]
+
+    project_ref = project_ref.strip().strip(".")
+    if not project_ref:
+        raise ValueError("PROJECT_ID_URL is missing")
+    return project_ref
 
 
 def resolve_supabase_url(raw: str | None = None) -> tuple[str, str]:
     """
-    Bulletproof PROJECT_ID_URL → (project_ref, https_base_url).
-
-    Accepts:
-      - raw project ref:  ujhsltlhlnwuysikzvhs
-      - host:             ujhsltlhlnwuysikzvhs.supabase.co
-      - https URL:        https://ujhsltlhlnwuysikzvhs.supabase.co[/...]
-      - http URL:         upgraded to https
+    Returns (clean_ref, supabase_url) with
+    supabase_url = f\"https://{clean_ref}.supabase.co\".
+    Raises ValueError if PROJECT_ID_URL is missing/empty after cleaning.
     """
-    value = _clean_project_id_url_raw(
-        raw if raw is not None else os.environ.get("PROJECT_ID_URL")
-    )
-    if not value:
-        return "", ""
-
-    # Scheme-less host that already includes .supabase.co
-    lower = value.lower()
-    if not lower.startswith("http://") and not lower.startswith("https://"):
-        if ".supabase.co" in lower:
-            # e.g. project.supabase.co or project.supabase.co/rest/v1
-            host_part = value.split("/")[0]
-            host_part = host_part.split("?")[0].strip().lower()
-            if host_part.endswith(".supabase.co"):
-                ref = host_part[: -len(".supabase.co")]
-                ref = ref.strip(".").strip()
-                if ref:
-                    return ref, f"https://{ref}.supabase.co"
-        # Raw project id (letters, digits, hyphens)
-        ref = value.strip().strip(".")
-        if not ref:
-            return "", ""
-        # Guard against doubled suffix: "abc.supabase.co.supabase.co"
-        if ref.lower().endswith(".supabase.co"):
-            ref = ref[: -len(".supabase.co")]
-        return ref, f"https://{ref}.supabase.co"
-
-    # Full URL with scheme
-    if lower.startswith("http://"):
-        value = "https://" + value[7:]
-        lower = value.lower()
-
-    parsed = urlparse(value)
-    host = (parsed.netloc or "").lower().strip()
-    if not host and parsed.path:
-        # Edge: https://project-ref  (rare; treat path as host)
-        host = parsed.path.split("/")[0].lower()
-
-    if not host:
-        return "", ""
-
-    if host.endswith(".supabase.co"):
-        ref = host[: -len(".supabase.co")].strip(".")
-        if not ref:
-            return "", ""
-        return ref, f"https://{ref}.supabase.co"
-
-    # https://<raw-project-id> with no .supabase.co yet
-    if "." not in host:
-        return host, f"https://{host}.supabase.co"
-
-    # Unknown host shape — still force https base from host
-    return host.split(".")[0], f"https://{host}"
+    clean_ref = clean_project_ref(raw)
+    supabase_url = f"https://{clean_ref}.supabase.co"
+    return clean_ref, supabase_url
 
 
 def mask_supabase_url(url: str) -> str:
@@ -148,7 +116,7 @@ def mask_supabase_url(url: str) -> str:
 
 
 def build_supabase_url(project_id: str | None = None) -> str:
-    """Return resolved https://{ref}.supabase.co from PROJECT_ID_URL or argument."""
+    """Return https://{clean_ref}.supabase.co from PROJECT_ID_URL or argument."""
     _ref, url = resolve_supabase_url(project_id)
     return url
 
@@ -159,9 +127,12 @@ def refresh_supabase_credentials() -> tuple[str, str, str, str]:
     Returns (project_ref, supabase_url, publishable_key, secret_keys).
     """
     global PROJECT_ID_URL, SUPABASE_URL, PUBLISHABLE_KEY, SECRET_KEYS
-    PROJECT_ID_URL, SUPABASE_URL = resolve_supabase_url(
-        os.environ.get("PROJECT_ID_URL")
-    )
+    try:
+        PROJECT_ID_URL, SUPABASE_URL = resolve_supabase_url(
+            os.environ.get("PROJECT_ID_URL")
+        )
+    except ValueError:
+        PROJECT_ID_URL, SUPABASE_URL = "", ""
     PUBLISHABLE_KEY = _env_str("PUBLISHABLE_KEY")
     SECRET_KEYS = _env_str("SECRET_KEYS")
     return PROJECT_ID_URL, SUPABASE_URL, PUBLISHABLE_KEY, SECRET_KEYS
@@ -615,19 +586,26 @@ def preflight_check() -> Client:
     else:
         _log("[preflight] No legacy Supabase env key names detected")
 
-    raw_env = os.environ.get("PROJECT_ID_URL")
-    cleaned_raw = _clean_project_id_url_raw(raw_env)
-    project_id, url, publishable, secret = refresh_supabase_credentials()
+    # Strict URL parse: strip → raw ref → https://{ref}.supabase.co
+    try:
+        clean_ref, url = resolve_supabase_url(os.environ.get("PROJECT_ID_URL"))
+    except ValueError as e:
+        raise CredentialError(str(e)) from e
+
     _log(
-        f"PROJECT_ID_URL resolved_ref: "
-        f"{'True' if project_id else 'False'}"
-        + (
-            f" (masked={project_id[:4]}****{project_id[-4:]})"
-            if len(project_id) > 8
-            else ""
-        )
+        f"[preflight] clean project ref length={len(clean_ref)} "
+        f"(value never printed)"
     )
-    _log(f"Resolved SUPABASE_URL (masked): {mask_supabase_url(url)}")
+    _log(f"[preflight] constructed SUPABASE_URL (masked): {mask_supabase_url(url)}")
+
+    # Keep globals in sync for the rest of the run
+    global PROJECT_ID_URL, SUPABASE_URL, PUBLISHABLE_KEY, SECRET_KEYS
+    PROJECT_ID_URL = clean_ref
+    SUPABASE_URL = url
+    PUBLISHABLE_KEY = _env_str("PUBLISHABLE_KEY")
+    SECRET_KEYS = _env_str("SECRET_KEYS")
+    publishable, secret = PUBLISHABLE_KEY, SECRET_KEYS
+
     _log(
         f"PUBLISHABLE_KEY usable: {'True' if publishable else 'False'} "
         f"(len={len(publishable)})"
@@ -641,11 +619,6 @@ def preflight_check() -> Client:
         f"SUPPORT={SUPPORT_MIN} SALES={SALES_MIN}"
     )
 
-    if not project_id or not url:
-        raise CredentialError(
-            "missing or unparseable PROJECT_ID_URL — expected a project ref "
-            "or https://{ref}.supabase.co"
-        )
     if not secret:
         raise CredentialError(
             "missing SECRET_KEYS — required for database writes"
