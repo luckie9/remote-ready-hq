@@ -257,3 +257,45 @@ export async function findStripeCustomerByEmail(
   }
   return fallback;
 }
+
+/** Use the Stripe customer for this email, creating one when Checkout never stored it. */
+export async function ensureStripeCustomer(
+  email: string,
+  authUserId?: string | null
+): Promise<StripeCustomerMatch | null> {
+  const existing = await findStripeCustomerByEmail(email);
+  if (existing?.customerId) {
+    await saveStripeCustomerLink({
+      email,
+      authUserId,
+      customerId: existing.customerId,
+      subscriptionId: existing.subscriptionId,
+      status: existing.status || 'active',
+    });
+    return existing;
+  }
+
+  let stripe: Stripe;
+  try {
+    stripe = getStripe();
+  } catch {
+    return null;
+  }
+
+  try {
+    const created = await stripe.customers.create({
+      email: email.trim().toLowerCase(),
+      metadata: authUserId ? { supabase_user_id: authUserId } : undefined,
+    });
+    await saveStripeCustomerLink({
+      email,
+      authUserId,
+      customerId: created.id,
+      subscriptionId: null,
+      status: 'active',
+    });
+    return { customerId: created.id, subscriptionId: null, status: null };
+  } catch {
+    return null;
+  }
+}

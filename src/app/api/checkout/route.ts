@@ -1,4 +1,5 @@
-import { getStripe, STRIPE_PRICES } from '@/lib/stripe';
+import { getStripe, PLAN_AMOUNTS, STRIPE_PRICES } from '@/lib/stripe';
+import { findStripeCustomerByEmail } from '@/lib/stripe-mapping';
 
 export const runtime = 'nodejs';
 
@@ -80,7 +81,6 @@ export async function POST(request: Request) {
     const email = body.email?.trim().toLowerCase();
 
     const stripe = getStripe();
-    // Prefer env; fall back to hardcoded $1.97 trial / unlock price ID
     const monthlyPriceId = STRIPE_PRICES.monthly;
     const trialPriceId = STRIPE_PRICES.trial || monthlyPriceId;
 
@@ -91,58 +91,68 @@ export async function POST(request: Request) {
       );
     }
 
-    // Unlock / $1.97 pass uses trial price (or monthly env when trial unset).
-    const primaryPriceId = plan === 'trial' ? trialPriceId : monthlyPriceId;
-    const price = await stripe.prices.retrieve(primaryPriceId);
-    const isRecurring = Boolean(price.recurring);
+    const configuredPriceId = plan === 'trial' ? trialPriceId : monthlyPriceId;
+    const configuredPrice = await stripe.prices.retrieve(configuredPriceId);
+    const lineItems: {
+      price?: string;
+      quantity: number;
+      price_data?: {
+        currency: string;
+        unit_amount: number;
+        recurring: { interval: 'month' };
+        product_data: { name: string };
+      };
+    }[] = [];
 
-    // One-time prices (e.g. $1.97 pass) require payment mode.
-    // Recurring prices use subscription mode.
-    const mode = isRecurring ? 'subscription' : 'payment';
-    const resolvedPlan = mode === 'payment' ? 'trial' : plan;
+    if (plan === 'trial' && !configuredPrice.recurring) {
+      lineItems.push({ price: configuredPrice.id, quantity: 1 });
+    }
+
+    if (configuredPrice.recurring) {
+      lineItems.push({ price: configuredPrice.id, quantity: 1 });
+    } else {
+      lineItems.push({
+        quantity: 1,
+        price_data: {
+          currency: configuredPrice.currency || 'usd',
+          unit_amount: PLAN_AMOUNTS.monthlyCents,
+          recurring: { interval: 'month' },
+          product_data: { name: 'RemoteReady HQ Monthly Membership' },
+        },
+      });
+    }
+
+    const existingCustomer = email
+      ? await findStripeCustomerByEmail(email)
+      : null;
 
     const appBase = resolveAppUrl(request);
-    // Route Handler sets the entitlement cookie, then redirects to /success.
     const successUrl = `${appBase}/api/stripe/success?session_id={CHECKOUT_SESSION_ID}`;
     const cancelUrl = `${appBase}/pricing?canceled=1`;
 
-    const session = await stripe.checkout.sessions.create(
-      mode === 'payment'
-        ? {
-            mode: 'payment',
-            customer_email: email || undefined,
-            customer_creation: 'always',
-            line_items: [{ price: primaryPriceId, quantity: 1 }],
-            success_url: successUrl,
-            cancel_url: cancelUrl,
-            allow_promotion_codes: true,
-            metadata: {
-              plan: resolvedPlan,
-              app: 'remote-ready-hq',
-              checkout_mode: 'payment',
-            },
-          }
-        : {
-            mode: 'subscription',
-            customer_email: email || undefined,
-            line_items: [{ price: primaryPriceId, quantity: 1 }],
-            success_url: successUrl,
-            cancel_url: cancelUrl,
-            allow_promotion_codes: true,
-            subscription_data: {
-              trial_period_days: plan === 'trial' ? 3 : undefined,
-              metadata: {
-                plan,
-                app: 'remote-ready-hq',
-              },
-            },
-            metadata: {
-              plan,
-              app: 'remote-ready-hq',
-              checkout_mode: 'subscription',
-            },
-          }
-    );
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      ...(existingCustomer?.customerId
+        ? { customer: existingCustomer.customerId }
+        : { customer_email: email || undefined }),
+      line_items: lineItems,
+      success_url: successUrl,
+      cancel_url: cancelUrl,
+      allow_promotion_codes: true,
+      subscription_data: {
+        ...(plan === 'trial' ? { trial_period_days: PLAN_AMOUNTS.trialDays } : {}),
+        metadata: {
+          plan,
+          app: 'remote-ready-hq',
+        },
+      },
+      metadata: {
+        plan,
+        app: 'remote-ready-hq',
+        checkout_mode: 'subscription',
+        ...(email ? { email } : {}),
+      },
+    });
 
     if (!session.url) {
       return Response.json(

@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { createClient } from '@/lib/supabase/server';
 import { loadBillingTarget } from '@/lib/profile-subscription';
 import { getStripe } from '@/lib/stripe';
+import { ensureStripeCustomer } from '@/lib/stripe-mapping';
 import type Stripe from 'stripe';
 
 function appOrigin(request: Request): string {
@@ -27,15 +28,20 @@ export async function openBillingPortal(request: Request, cancel: boolean) {
     return NextResponse.json({ error: 'Sign in required' }, { status: 401 });
   }
 
-  const { customerId, subscriptionId } = await loadBillingTarget(
+  let { customerId, subscriptionId } = await loadBillingTarget(
     supabase,
     user.id,
     user.email
   );
   if (!customerId) {
+    const ensured = await ensureStripeCustomer(user.email, user.id);
+    customerId = ensured?.customerId ?? null;
+    subscriptionId = subscriptionId || ensured?.subscriptionId || null;
+  }
+  if (!customerId) {
     return NextResponse.json(
-      { error: 'No Stripe customer is linked to this account yet.' },
-      { status: 409 }
+      { error: 'Stripe could not open a billing profile for this account.' },
+      { status: 502 }
     );
   }
 
