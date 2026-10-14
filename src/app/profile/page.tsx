@@ -1,10 +1,11 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { SiteFooter } from '@/components/SiteFooter';
 import { SiteHeader } from '@/components/SiteHeader';
 import { useAuth } from '@/components/AuthProvider';
+import type { ProfileSubscription } from '@/lib/profile-subscription';
 
 export default function ProfilePage() {
   const {
@@ -100,21 +101,7 @@ export default function ProfilePage() {
               )}
             </section>
 
-            <section className="rounded-xl border border-slate-800 bg-[#161F2E] p-5">
-              <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500">
-                Subscription
-              </h2>
-              <p className="mt-3 text-sm text-slate-300">
-                Unlock direct recruiter links with a $1.97 3-day pass, then
-                $13.97/mo.
-              </p>
-              <Link
-                href="/pricing"
-                className="mt-4 inline-flex rounded-full bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-500"
-              >
-                View pricing
-              </Link>
-            </section>
+            <ProfileSubscriptionSection />
 
             <section className="rounded-xl border border-slate-800 bg-[#161F2E] p-5">
               <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500">
@@ -172,5 +159,164 @@ export default function ProfilePage() {
       </div>
       <SiteFooter />
     </main>
+  );
+}
+
+function formatPlanDate(value: string | null): string {
+  if (!value) return '—';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '—';
+  return new Intl.DateTimeFormat('en-US', {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+  }).format(date);
+}
+
+function ProfileSubscriptionSection() {
+  const { user, jobAlertsReady } = useAuth();
+  const [details, setDetails] = useState<ProfileSubscription | null>(null);
+  const [ready, setReady] = useState(false);
+  const [actionError, setActionError] = useState('');
+  const [busy, setBusy] = useState<'upgrade' | 'manage' | null>(null);
+
+  useEffect(() => {
+    if (!jobAlertsReady) return;
+    if (!user?.email) {
+      setDetails(null);
+      setReady(true);
+      return;
+    }
+    let cancelled = false;
+    setReady(false);
+    fetch('/api/subscription/status')
+      .then((res) => res.json())
+      .then((data: ProfileSubscription) => {
+        if (!cancelled) setDetails(data?.active ? data : null);
+      })
+      .catch(() => {
+        if (!cancelled) setDetails(null);
+      })
+      .finally(() => {
+        if (!cancelled) setReady(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [jobAlertsReady, user?.email]);
+
+  async function upgradeMonthly() {
+    setBusy('upgrade');
+    setActionError('');
+    try {
+      const res = await fetch('/api/checkout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ plan: 'monthly', email: user?.email }),
+      });
+      const data = (await res.json()) as { url?: string; error?: string };
+      if (!res.ok || !data.url) {
+        throw new Error(data.error || 'Unable to start checkout');
+      }
+      window.location.href = data.url;
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Unable to start checkout');
+      setBusy(null);
+    }
+  }
+
+  async function manageSubscription() {
+    setBusy('manage');
+    setActionError('');
+    try {
+      const res = await fetch('/api/subscription/portal', { method: 'POST' });
+      const data = (await res.json()) as { url?: string; error?: string };
+      if (!res.ok || !data.url) {
+        throw new Error(data.error || 'Unable to open the billing portal');
+      }
+      window.location.href = data.url;
+    } catch (err) {
+      setActionError(
+        err instanceof Error ? err.message : 'Unable to open the billing portal'
+      );
+      setBusy(null);
+    }
+  }
+
+  const showActive = Boolean(ready && details?.active);
+
+  return (
+    <section className="rounded-xl border border-slate-800 bg-[#161F2E] p-5">
+      <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500">
+        Subscription
+      </h2>
+      {!jobAlertsReady || (user && !ready) ? (
+        <p className="mt-3 text-sm text-slate-400">Loading membership…</p>
+      ) : showActive && details ? (
+        <div className="mt-3">
+          <p className="text-sm font-semibold text-emerald-300">Active member</p>
+          <dl className="mt-4 space-y-2 text-sm">
+            <div className="flex items-baseline justify-between gap-4">
+              <dt className="text-slate-400">Current plan</dt>
+              <dd className="font-medium text-white">{details.planLabel}</dd>
+            </div>
+            <div className="flex items-baseline justify-between gap-4">
+              <dt className="text-slate-400">Start date</dt>
+              <dd className="font-medium text-white">
+                {formatPlanDate(details.startedAt)}
+              </dd>
+            </div>
+            <div className="flex items-baseline justify-between gap-4">
+              <dt className="text-slate-400">{details.dateLabel}</dt>
+              <dd className="font-medium text-white">
+                {formatPlanDate(details.endsAt)}
+              </dd>
+            </div>
+          </dl>
+          <div className="mt-4 flex flex-wrap gap-2">
+            {details.plan === 'trial' ? (
+              <button
+                type="button"
+                onClick={() => void upgradeMonthly()}
+                disabled={busy !== null}
+                className="rounded-full bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-500 disabled:opacity-60"
+              >
+                {busy === 'upgrade' ? 'Redirecting…' : 'Upgrade / Add Monthly'}
+              </button>
+            ) : null}
+            {details.plan === 'monthly' || details.canManage ? (
+              <button
+                type="button"
+                onClick={() => void manageSubscription()}
+                disabled={busy !== null}
+                className={
+                  details.plan === 'trial'
+                    ? 'rounded-full border border-slate-700 px-4 py-2 text-sm font-medium text-slate-200 hover:border-slate-600 disabled:opacity-60'
+                    : 'rounded-full bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-500 disabled:opacity-60'
+                }
+              >
+                {busy === 'manage' ? 'Redirecting…' : 'Manage Subscription'}
+              </button>
+            ) : null}
+          </div>
+          {actionError && (
+            <p className="mt-3 text-sm text-red-300">{actionError}</p>
+          )}
+        </div>
+      ) : (
+        <>
+          <p className="mt-3 text-sm text-slate-300">
+            Unlock direct recruiter links with a $1.97 3-day pass, then
+            $13.97/mo.
+          </p>
+          <Link
+            href="/pricing"
+            className="mt-4 inline-flex rounded-full bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-500"
+          >
+            View pricing
+          </Link>
+        </>
+      )}
+    </section>
   );
 }
