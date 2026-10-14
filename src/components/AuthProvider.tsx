@@ -192,13 +192,32 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       return;
     }
     try {
-      const res = await fetch('/api/applications');
-      if (!res.ok) {
+      const saved = await fetch('/api/applications');
+      if (!saved.ok) {
         setAppliedJobIds(local);
         return;
       }
-      const data = (await res.json()) as { jobIds?: string[] };
-      const merged = new Set([...(data.jobIds ?? []), ...local]);
+      let jobIds =
+        ((await saved.json()) as { jobIds?: string[] }).jobIds ?? [];
+      const pending = [...local].filter((jobId) => !jobIds.includes(jobId));
+      if (pending.length > 0) {
+        await Promise.all(
+          pending.map((jobId) =>
+            fetch('/api/applications', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ jobId }),
+            })
+          )
+        );
+        const refreshed = await fetch('/api/applications');
+        if (refreshed.ok) {
+          jobIds =
+            ((await refreshed.json()) as { jobIds?: string[] }).jobIds ??
+            jobIds;
+        }
+      }
+      const merged = new Set([...jobIds, ...local]);
       setAppliedJobIds(merged);
       writeLocalApplied(merged);
     } catch {

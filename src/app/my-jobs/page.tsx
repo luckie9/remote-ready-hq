@@ -2,89 +2,15 @@ import Link from 'next/link';
 import { SiteFooter } from '@/components/SiteFooter';
 import { SiteHeader } from '@/components/SiteHeader';
 import { createClient } from '@/lib/supabase/server';
-import { createAdminSupabase } from '@/lib/supabase';
+import { loadUserApplications } from '@/lib/user-applications';
 import {
   formatLocation,
   formatRelativeTime,
   formatSalaryHighlight,
-  isLiveScrapedApplyUrl,
-  type Job,
 } from '@/lib/jobs';
 
+export const dynamic = 'force-dynamic';
 export const revalidate = 0;
-
-type AppliedRow = {
-  job_id: string;
-  applied_at?: string | null;
-  created_at?: string | null;
-  jobs: Job | Job[] | null;
-};
-
-function rowTimestamp(row: AppliedRow): string {
-  return row.applied_at || row.created_at || new Date().toISOString();
-}
-
-/**
- * Load applied jobs for the signed-in user.
- * Any missing-table / schema / query failure soft-fails to [].
- */
-async function loadAppliedJobs(userId: string): Promise<
-  { job: Job; applied_at: string }[]
-> {
-  const selectCols =
-    'job_id, applied_at, created_at, jobs ( id, title, company, location, salary, apply_url, created_at, description )';
-
-  try {
-    let data: AppliedRow[] | null = null;
-    let error: { code?: string; message?: string } | null = null;
-
-    try {
-      const admin = createAdminSupabase();
-      const res = await admin
-        .from('user_applications')
-        .select(selectCols)
-        .eq('user_id', userId)
-        .order('applied_at', { ascending: false });
-      data = (res.data as AppliedRow[] | null) ?? null;
-      error = res.error;
-
-      // If applied_at column missing, retry with created_at only
-      if (error && /applied_at/i.test(error.message || '')) {
-        const retry = await admin
-          .from('user_applications')
-          .select(
-            'job_id, created_at, jobs ( id, title, company, location, salary, apply_url, created_at, description )'
-          )
-          .eq('user_id', userId)
-          .order('created_at', { ascending: false });
-        data = (retry.data as AppliedRow[] | null) ?? null;
-        error = retry.error;
-      }
-    } catch {
-      const supabase = await createClient();
-      const res = await supabase
-        .from('user_applications')
-        .select(selectCols)
-        .eq('user_id', userId)
-        .order('applied_at', { ascending: false });
-      data = (res.data as AppliedRow[] | null) ?? null;
-      error = res.error;
-    }
-
-    // Missing table, RLS, or any query error → empty list (no UI warning)
-    if (error) return [];
-
-    return (data ?? [])
-      .map((row) => {
-        const job = Array.isArray(row.jobs) ? row.jobs[0] : row.jobs;
-        if (!job || !isLiveScrapedApplyUrl(job.apply_url)) return null;
-        return { job, applied_at: rowTimestamp(row) };
-      })
-      .filter(Boolean) as { job: Job; applied_at: string }[];
-  } catch {
-    return [];
-  }
-}
 
 export default async function MyJobsPage() {
   const supabase = await createClient();
@@ -92,7 +18,7 @@ export default async function MyJobsPage() {
     data: { user },
   } = await supabase.auth.getUser();
 
-  const rows = user ? await loadAppliedJobs(user.id) : [];
+  const rows = user ? await loadUserApplications(supabase, user.id) : [];
 
   return (
     <main className="flex-1 bg-slate-950 text-slate-100">
