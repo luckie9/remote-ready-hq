@@ -21,6 +21,9 @@ type AuthContextValue = {
   authOpen: boolean;
   alertOpen: boolean;
   hasSubscribedAlerts: boolean;
+  /** Paid members and people who already shared an email should not see the alert prompt. */
+  hideJobAlerts: boolean;
+  jobAlertsReady: boolean;
   openAuth: () => void;
   closeAuth: () => void;
   openAlert: () => void;
@@ -35,6 +38,8 @@ const AuthContext = createContext<AuthContextValue | null>(null);
 
 const APPLIED_KEY = 'rrhq_applied_jobs';
 export const ALERT_SUBSCRIBED_KEY = 'has_subscribed_job_alerts';
+/** Persists a dismissed alert prompt across reloads and client navigations. */
+const ALERT_HIDE_KEY = 'rrhq_hide_job_alerts';
 const ALERT_SESSION_START_KEY = 'rrhq_alert_session_start';
 const ALERT_FIRED_KEY = 'rrhq_alert_triggers_fired';
 
@@ -65,6 +70,28 @@ function writeLocalApplied(ids: Set<string>) {
 function readSubscribed(): boolean {
   if (typeof window === 'undefined') return false;
   return window.localStorage.getItem(ALERT_SUBSCRIBED_KEY) === '1';
+}
+
+function readAlertHidden(): boolean {
+  if (typeof window === 'undefined') return false;
+  return (
+    readSubscribed() || window.localStorage.getItem(ALERT_HIDE_KEY) === '1'
+  );
+}
+
+function writeAlertHidden(hidden: boolean) {
+  if (typeof window === 'undefined') return;
+  if (hidden) window.localStorage.setItem(ALERT_HIDE_KEY, '1');
+  else window.localStorage.removeItem(ALERT_HIDE_KEY);
+}
+
+function emailIsConfirmed(user: User | null): boolean {
+  if (!user?.email) return false;
+  const record = user as User & {
+    email_confirmed_at?: string | null;
+    confirmed_at?: string | null;
+  };
+  return Boolean(record.email_confirmed_at || record.confirmed_at);
 }
 
 function getSessionStart(): number {
@@ -114,13 +141,46 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [authOpen, setAuthOpen] = useState(false);
   const [alertOpen, setAlertOpen] = useState(false);
   const [hasSubscribedAlerts, setHasSubscribedAlerts] = useState(false);
+  const [hideJobAlerts, setHideJobAlerts] = useState(false);
+  const [jobAlertsReady, setJobAlertsReady] = useState(false);
   const alertOpenRef = useRef(false);
+  const hideJobAlertsRef = useRef(false);
+  const alertCheckRef = useRef(0);
   const scheduleGenRef = useRef(0);
   const lastSyncedUserId = useRef<string | null>(null);
 
   useEffect(() => {
     alertOpenRef.current = alertOpen;
   }, [alertOpen]);
+
+  useEffect(() => {
+    hideJobAlertsRef.current = hideJobAlerts;
+  }, [hideJobAlerts]);
+
+  const resolveAlertSuppression = useCallback(
+    async (current: User | null): Promise<boolean> => {
+      if (readSubscribed()) return true;
+      if (!current?.email) return false;
+      if (emailIsConfirmed(current)) return true;
+
+      const unlocked = await syncUnlockCookie();
+      if (unlocked) return true;
+
+      try {
+        const email = current.email.trim().toLowerCase();
+        const { data, error } = await supabase
+          .from('job_alerts')
+          .select('email')
+          .ilike('email', email)
+          .maybeSingle();
+        if (!error && data?.email) return true;
+      } catch {
+        // Missing table or RLS — local session state still applies.
+      }
+      return false;
+    },
+    [supabase]
+  );
 
   const refreshApplications = useCallback(async () => {
     const local = readLocalApplied();
@@ -149,26 +209,41 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     let mounted = true;
     setAppliedJobIds(readLocalApplied());
+    const storedHide = readAlertHidden();
     setHasSubscribedAlerts(readSubscribed());
+    setHideJobAlerts(storedHide);
+
+    async function applyUser(current: User | null) {
+      const checkId = ++alertCheckRef.current;
+      if (!mounted) return;
+      setUser(current);
+      const hide = await resolveAlertSuppression(current);
+      if (!mounted || checkId !== alertCheckRef.current) return;
+      setHideJobAlerts(hide);
+      if (hide) writeAlertHidden(true);
+      else if (!readSubscribed()) writeAlertHidden(false);
+      if (hide) setAlertOpen(false);
+      setJobAlertsReady(true);
+    }
 
     supabase.auth
       .getUser()
-      .then(({ data }) => {
+      .then(({ data }) => applyUser(data.user ?? null))
+      .catch(() => {
         if (!mounted) return;
-        setUser(data.user ?? null);
-      })
-      .catch(() => undefined);
+        setJobAlertsReady(true);
+      });
 
     const {
       data: { subscription },
     } = supabase.auth.onAuthStateChange((_event, session) => {
-      setUser(session?.user ?? null);
+      void applyUser(session?.user ?? null);
     });
     return () => {
       mounted = false;
       subscription.unsubscribe();
     };
-  }, [supabase]);
+  }, [supabase, resolveAlertSuppression]);
 
   useEffect(() => {
     void refreshApplications();
@@ -193,7 +268,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     scheduleGenRef.current += 1;
     const gen = scheduleGenRef.current;
 
-    if (readSubscribed() || hasSubscribedAlerts) return;
+    if (readSubscribed() || hasSubscribedAlerts || hideJobAlertsRef.current) return;
 
     const start = getSessionStart();
     const fired = new Set(readFiredTriggers());
@@ -205,7 +280,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
     const timer = window.setTimeout(() => {
       if (gen !== scheduleGenRef.current) return;
-      if (readSubscribed()) return;
+      if (readSubscribed() || hideJobAlertsRef.current) return;
       if (alertOpenRef.current) {
         // Modal already open (manual) — retry soon without consuming the slot
         window.setTimeout(() => {
@@ -221,16 +296,22 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [hasSubscribedAlerts]);
 
   useEffect(() => {
-    if (hasSubscribedAlerts) return;
+    if (!jobAlertsReady || hideJobAlerts) return;
     if (alertOpen) return;
     return scheduleNextAlert();
-  }, [alertOpen, hasSubscribedAlerts, scheduleNextAlert]);
+  }, [alertOpen, hideJobAlerts, jobAlertsReady, scheduleNextAlert]);
+
+  useEffect(() => {
+    if (hideJobAlerts) setAlertOpen(false);
+  }, [hideJobAlerts]);
 
   const markAlertSubscribed = useCallback(() => {
     if (typeof window !== 'undefined') {
       window.localStorage.setItem(ALERT_SUBSCRIBED_KEY, '1');
+      writeAlertHidden(true);
     }
     setHasSubscribedAlerts(true);
+    setHideJobAlerts(true);
     setAlertOpen(false);
   }, []);
 
@@ -262,6 +343,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const signOut = useCallback(async () => {
     await supabase.auth.signOut();
+    writeAlertHidden(readSubscribed());
+    setHideJobAlerts(readSubscribed());
   }, [supabase]);
 
   const value = useMemo<AuthContextValue>(
@@ -272,9 +355,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       authOpen,
       alertOpen,
       hasSubscribedAlerts,
+      hideJobAlerts,
+      jobAlertsReady,
       openAuth: () => setAuthOpen(true),
       closeAuth: () => setAuthOpen(false),
-      openAlert: () => setAlertOpen(true),
+      openAlert: () => {
+        if (hideJobAlertsRef.current) return;
+        setAlertOpen(true);
+      },
       closeAlert: () => setAlertOpen(false),
       markAlertSubscribed,
       signOut,
@@ -288,6 +376,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       authOpen,
       alertOpen,
       hasSubscribedAlerts,
+      hideJobAlerts,
+      jobAlertsReady,
       markAlertSubscribed,
       signOut,
       markApplied,

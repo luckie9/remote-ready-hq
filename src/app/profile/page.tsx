@@ -7,8 +7,16 @@ import { SiteHeader } from '@/components/SiteHeader';
 import { useAuth } from '@/components/AuthProvider';
 
 export default function ProfilePage() {
-  const { user, loading, openAuth, openAlert, signOut, appliedJobIds } =
-    useAuth();
+  const {
+    user,
+    loading,
+    openAuth,
+    openAlert,
+    signOut,
+    appliedJobIds,
+    hideJobAlerts,
+    jobAlertsReady,
+  } = useAuth();
   const [dailyEnabled, setDailyEnabled] = useState(true);
   const [saveMsg, setSaveMsg] = useState('');
 
@@ -129,13 +137,15 @@ export default function ProfilePage() {
                 >
                   Save preferences
                 </button>
-                <button
-                  type="button"
-                  onClick={openAlert}
-                  className="rounded-full border border-slate-700 px-4 py-2 text-sm font-medium text-slate-200 hover:border-slate-600"
-                >
-                  Open alerts popup
-                </button>
+                {jobAlertsReady && !hideJobAlerts && (
+                  <button
+                    type="button"
+                    onClick={openAlert}
+                    className="rounded-full border border-slate-700 px-4 py-2 text-sm font-medium text-slate-200 hover:border-slate-600"
+                  >
+                    Open alerts popup
+                  </button>
+                )}
               </div>
               {saveMsg && (
                 <p className="mt-3 text-sm text-emerald-400">{saveMsg}</p>

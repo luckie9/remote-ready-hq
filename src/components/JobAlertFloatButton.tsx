@@ -3,9 +3,9 @@
 import { useAuth } from '@/components/AuthProvider';
 
 export function JobAlertFloatButton() {
-  const { openAlert, hasSubscribedAlerts, alertOpen } = useAuth();
+  const { openAlert, hideJobAlerts, jobAlertsReady, alertOpen } = useAuth();
 
-  if (hasSubscribedAlerts || alertOpen) return null;
+  if (!jobAlertsReady || hideJobAlerts || alertOpen) return null;
 
   return (
     <button

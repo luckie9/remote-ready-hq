@@ -13,7 +13,8 @@ const NAV = [
 
 export function SiteHeader() {
   const pathname = usePathname();
-  const { user, loading, openAuth, openAlert, signOut } = useAuth();
+  const { user, loading, openAuth, openAlert, signOut, hideJobAlerts, jobAlertsReady } =
+    useAuth();
 
   return (
     <header className="animate-rise border-b border-slate-800 pb-5">
@@ -43,6 +44,7 @@ export function SiteHeader() {
         </nav>
 
         <div className="flex items-center gap-2 text-sm">
+          {jobAlertsReady && !hideJobAlerts && (
           <button
             type="button"
             onClick={openAlert}
@@ -65,6 +67,7 @@ export function SiteHeader() {
               <path d="M9.5 17a2.5 2.5 0 0 0 5 0" strokeLinecap="round" />
             </svg>
           </button>
+          )}
 
           {loading ? (
             <span className="rounded-full border border-slate-800 px-3.5 py-1.5 text-slate-500">

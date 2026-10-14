@@ -5,7 +5,7 @@ import { useAuth } from '@/components/AuthProvider';
 import { track } from '@/lib/analytics';
 
 export function JobAlertModal() {
-  const { alertOpen, closeAlert, markAlertSubscribed } = useAuth();
+  const { alertOpen, closeAlert, markAlertSubscribed, hideJobAlerts } = useAuth();
   const [email, setEmail] = useState('');
   const [status, setStatus] = useState<'idle' | 'loading' | 'done' | 'error'>(
     'idle'
@@ -20,7 +20,7 @@ export function JobAlertModal() {
     }
   }, [alertOpen]);
 
-  if (!alertOpen) return null;
+  if (!alertOpen || hideJobAlerts) return null;
 
   async function onSubmit(e: FormEvent) {
     e.preventDefault();
