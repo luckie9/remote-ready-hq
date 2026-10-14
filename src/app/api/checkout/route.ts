@@ -1,4 +1,4 @@
-import { getStripe, PLAN_AMOUNTS, STRIPE_PRICES } from '@/lib/stripe';
+import { getStripe, PLAN_AMOUNTS, STRIPE_PRICES, DEFAULT_STRIPE_PRICE_ID_MONTHLY } from '@/lib/stripe';
 import { findStripeCustomerByEmail } from '@/lib/stripe-mapping';
 
 export const runtime = 'nodejs';
@@ -81,46 +81,11 @@ export async function POST(request: Request) {
     const email = body.email?.trim().toLowerCase();
 
     const stripe = getStripe();
-    const monthlyPriceId = STRIPE_PRICES.monthly;
-    const trialPriceId = STRIPE_PRICES.trial || monthlyPriceId;
-
-    if (!monthlyPriceId) {
-      return Response.json(
-        { error: 'STRIPE_PRICE_ID_MONTHLY is not configured' },
-        { status: 500 }
-      );
-    }
-
-    const configuredPriceId = plan === 'trial' ? trialPriceId : monthlyPriceId;
-    const configuredPrice = await stripe.prices.retrieve(configuredPriceId);
-    const lineItems: {
-      price?: string;
-      quantity: number;
-      price_data?: {
-        currency: string;
-        unit_amount: number;
-        recurring: { interval: 'month' };
-        product_data: { name: string };
-      };
-    }[] = [];
-
-    if (plan === 'trial' && !configuredPrice.recurring) {
-      lineItems.push({ price: configuredPrice.id, quantity: 1 });
-    }
-
-    if (configuredPrice.recurring) {
-      lineItems.push({ price: configuredPrice.id, quantity: 1 });
-    } else {
-      lineItems.push({
-        quantity: 1,
-        price_data: {
-          currency: configuredPrice.currency || 'usd',
-          unit_amount: PLAN_AMOUNTS.monthlyCents,
-          recurring: { interval: 'month' },
-          product_data: { name: 'RemoteReady HQ Monthly Membership' },
-        },
-      });
-    }
+    const configuredMonthly = await stripe.prices.retrieve(STRIPE_PRICES.monthly);
+    const recurringPriceId = configuredMonthly.recurring
+      ? configuredMonthly.id
+      : DEFAULT_STRIPE_PRICE_ID_MONTHLY;
+    const trialFeeId = STRIPE_PRICES.trial;
 
     const existingCustomer = email
       ? await findStripeCustomerByEmail(email)
@@ -135,7 +100,13 @@ export async function POST(request: Request) {
       ...(existingCustomer?.customerId
         ? { customer: existingCustomer.customerId }
         : { customer_email: email || undefined }),
-      line_items: lineItems,
+      line_items:
+        plan === 'trial'
+          ? [
+              { price: trialFeeId, quantity: 1 },
+              { price: recurringPriceId, quantity: 1 },
+            ]
+          : [{ price: recurringPriceId, quantity: 1 }],
       success_url: successUrl,
       cancel_url: cancelUrl,
       allow_promotion_codes: true,

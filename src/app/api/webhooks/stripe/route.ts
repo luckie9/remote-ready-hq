@@ -59,48 +59,58 @@ export async function POST(request: Request) {
   try {
     switch (event.type) {
       case 'checkout.session.completed': {
-        const session = event.data.object as Stripe.Checkout.Session;
+        const incoming = event.data.object as Stripe.Checkout.Session;
+        const session = await stripe.checkout.sessions.retrieve(incoming.id, {
+          expand: ['subscription', 'customer'],
+        });
         const email =
           session.customer_details?.email ||
           session.customer_email ||
           session.metadata?.email;
         if (!email) break;
 
-        let status = 'active';
-        let plan = session.metadata?.plan === 'monthly' ? 'monthly' : 'trial';
-        let stripeSubscriptionId =
-          typeof session.subscription === 'string'
+        const expandedSubscription =
+          session.subscription && typeof session.subscription === 'object'
             ? session.subscription
-            : session.subscription?.id ?? null;
-        let currentPeriodEnd: number | null = null;
-        let priceId: string | null = null;
+            : null;
+        let stripeSubscriptionId =
+          expandedSubscription?.id ??
+          (typeof session.subscription === 'string' ? session.subscription : null);
         let stripeCustomerId =
           typeof session.customer === 'string'
             ? session.customer
             : session.customer?.id ?? null;
 
-        if (stripeSubscriptionId?.startsWith('sub_')) {
+        let status = expandedSubscription?.status || 'active';
+        let plan =
+          session.metadata?.plan === 'monthly'
+            ? 'monthly'
+            : expandedSubscription?.status === 'trialing'
+              ? 'trial'
+              : session.metadata?.plan === 'trial'
+                ? 'trial'
+                : 'monthly';
+        let currentPeriodEnd = expandedSubscription
+          ? periodEndFromSubscription(expandedSubscription)
+          : null;
+        let priceId = expandedSubscription?.items.data[0]?.price?.id ?? null;
+
+        if (stripeSubscriptionId?.startsWith('sub_') && !expandedSubscription) {
           const sub = await stripe.subscriptions.retrieve(stripeSubscriptionId);
           status = sub.status;
           plan = planFromSubscription(sub);
           currentPeriodEnd = periodEndFromSubscription(sub);
-          priceId = sub.items.data[0]?.price?.id ?? null;
+          priceId = sub.items.data[0]?.price?.id ?? priceId;
           const customer =
             typeof sub.customer === 'string' ? sub.customer : sub.customer?.id;
           stripeCustomerId = stripeCustomerId || customer || null;
-        } else if (session.mode === 'payment') {
-          status = 'trialing';
-          plan = 'trial';
-          currentPeriodEnd =
-            Math.floor(Date.now() / 1000) + 3 * 24 * 60 * 60;
-          stripeSubscriptionId = null;
         }
 
         if (!stripeCustomerId || !stripeSubscriptionId) {
           const found = await findStripeCustomerByEmail(email);
           stripeCustomerId = stripeCustomerId || found?.customerId || null;
           stripeSubscriptionId = stripeSubscriptionId || found?.subscriptionId || null;
-          if (found?.status) status = found.status;
+          if (!expandedSubscription && found?.status) status = found.status;
         }
 
         await upsertSubscriber({

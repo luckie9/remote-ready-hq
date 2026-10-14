@@ -20,8 +20,12 @@ export function getStripe(): Stripe {
   return stripeSingleton;
 }
 
-/** $1.97 trial / unlock price — used when env is unset */
+/** Recurring $13.97/month membership. The $1.97 price is a one-time trial fee. */
 export const DEFAULT_STRIPE_PRICE_ID_MONTHLY =
+  'price_1ULr5oKGX7AjcEKEaBpZjrsH';
+
+/** One-time $1.97 charged at the start of the 3-day trial. */
+export const DEFAULT_STRIPE_PRICE_ID_TRIAL =
   'price_1ULr5oKGX7AjcEKE1XO7gfp9';
 
 export const STRIPE_PRICES = {
@@ -29,7 +33,8 @@ export const STRIPE_PRICES = {
     process.env.STRIPE_PRICE_ID_MONTHLY ||
     process.env.NEXT_PUBLIC_STRIPE_PRICE_ID_MONTHLY ||
     DEFAULT_STRIPE_PRICE_ID_MONTHLY,
-  trial: process.env.STRIPE_PRICE_ID_TRIAL ?? '',
+  trial:
+    process.env.STRIPE_PRICE_ID_TRIAL || DEFAULT_STRIPE_PRICE_ID_TRIAL,
 } as const;
 
 /** Display + checkout amounts */
