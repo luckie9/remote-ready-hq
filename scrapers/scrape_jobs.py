@@ -13,10 +13,11 @@ import os
 import re
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Iterable
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
@@ -165,6 +166,41 @@ OPS_TITLE = re.compile(
     re.I,
 )
 
+# Listing quality gates
+MAX_LISTING_AGE_DAYS = 14
+_REMOTE_RE = re.compile(
+    r"\b(remote|work[\s-]*from[\s-]*home|wfh|distributed|anywhere|"
+    r"worldwide|telecommute|fully[\s-]*remote|100%[\s-]*remote)\b",
+    re.I,
+)
+_ONSITE_RE = re.compile(
+    r"\b(on[\s-]?site|in[\s-]?office|office[\s-]?based|no\s+remote|"
+    r"not\s+remote|must\s+relocate|relocation\s+required)\b",
+    re.I,
+)
+_PLACEHOLDER_COMPANY = frozenset(
+    {"", "unknown", "n/a", "na", "none", "null", "-", "tbd", "confidential"}
+)
+_PLACEHOLDER_URL_RE = re.compile(
+    r"(example\.(com|org|net)\b|placeholder|localhost|127\.0\.0\.1)",
+    re.I,
+)
+_TRACKING_PARAMS = frozenset(
+    {
+        "utm_source",
+        "utm_medium",
+        "utm_campaign",
+        "utm_term",
+        "utm_content",
+        "fbclid",
+        "gclid",
+        "mc_cid",
+        "mc_eid",
+        "ref",
+        "ref_src",
+    }
+)
+
 
 @dataclass(frozen=True)
 class JobListing:
@@ -180,9 +216,12 @@ class JobListing:
         raw = (
             f"{self.title.strip().lower()}|"
             f"{self.company.strip().lower()}|"
-            f"{self.apply_url.strip().lower()}"
+            f"{normalize_apply_url(self.apply_url)}"
         )
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def title_company_key(self) -> str:
+        return f"{self.title.strip().lower()}|{self.company.strip().lower()}"
 
 
 def normalize_whitespace(text: str | None) -> str:
@@ -287,6 +326,119 @@ def stamp_description(description: str, category: str) -> str:
     return f"rrhq_category:{category}\n{body}"
 
 
+def normalize_apply_url(raw: str | None) -> str:
+    """Canonical apply URL for dedupe + storage (https, no tracking params)."""
+    value = (raw or "").strip()
+    if not value or value.startswith("/"):
+        return ""
+    if not re.match(r"^https?://", value, flags=re.I):
+        value = "https://" + value.lstrip("/")
+    if value.lower().startswith("http://"):
+        value = "https://" + value[7:]
+    try:
+        parsed = urlparse(value)
+    except Exception:
+        return ""
+    if not parsed.netloc:
+        return ""
+    host = parsed.netloc.lower()
+    path = (parsed.path or "").rstrip("/")
+    kept = [
+        (k, v)
+        for k, v in parse_qsl(parsed.query, keep_blank_values=True)
+        if k.lower() not in _TRACKING_PARAMS
+    ]
+    kept.sort(key=lambda kv: (kv[0].lower(), kv[1]))
+    query = urlencode(kept, doseq=True)
+    return urlunparse(("https", host, path, "", query, ""))
+
+
+def parse_job_datetime(value: object | None) -> datetime | None:
+    """Parse common board date formats into an aware UTC datetime."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        dt = value
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    if isinstance(value, (int, float)):
+        ts = float(value)
+        if ts > 1e12:  # milliseconds
+            ts /= 1000.0
+        try:
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return parse_job_datetime(int(text))
+    # ISO-8601 (allow trailing Z)
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).astimezone(
+            timezone.utc
+        )
+    except ValueError:
+        pass
+    try:
+        dt = parsedate_to_datetime(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def is_fresh_enough(posted_at: object | None, *, max_age_days: int = MAX_LISTING_AGE_DAYS) -> bool:
+    """True if unknown date (keep) or posted within max_age_days."""
+    dt = parse_job_datetime(posted_at)
+    if dt is None:
+        return True
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+    return dt >= cutoff
+
+
+def is_remote_listing(
+    location: str,
+    title: str,
+    description: str = "",
+    *,
+    remote_hint: bool | None = None,
+    extra: str = "",
+) -> bool:
+    """Keep only remote-friendly roles; drop clear on-site-only listings."""
+    if remote_hint is False:
+        return False
+    if remote_hint is True:
+        return True
+    blob = f"{location}\n{title}\n{description}\n{extra}"
+    if _ONSITE_RE.search(blob) and not _REMOTE_RE.search(blob):
+        return False
+    if _REMOTE_RE.search(blob):
+        return True
+    loc = (location or "").strip().lower()
+    if not loc or loc in {"worldwide / remote", "worldwide", "anywhere", "remote"}:
+        return True
+    # Specific city/region without remote signal → treat as non-remote
+    return False
+
+
+def is_valid_record(title: str, company: str, apply_url: str) -> bool:
+    """Require non-empty title, company, and absolute application link."""
+    t = normalize_whitespace(title)
+    c = normalize_whitespace(company)
+    u = normalize_apply_url(apply_url)
+    if not t or not c or not u:
+        return False
+    if c.lower() in _PLACEHOLDER_COMPANY:
+        return False
+    if _PLACEHOLDER_URL_RE.search(u):
+        return False
+    return True
+
+
 BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -384,19 +536,27 @@ def make_listing(
     description: str,
     apply_url: str,
     category: str,
+    posted_at: object | None = None,
+    remote_hint: bool | None = None,
+    remote_extra: str = "",
 ) -> JobListing | None:
     title = normalize_whitespace(title)
-    company = normalize_whitespace(company) or "Unknown"
-    apply_url = (apply_url or "").strip()
-    if not title or not apply_url:
+    company = normalize_whitespace(company)
+    apply_url = normalize_apply_url(apply_url)
+    if not is_valid_record(title, company, apply_url):
         return None
-    if apply_url.startswith("/"):
+    if not is_fresh_enough(posted_at):
+        return None
+    loc = normalize_location(location)
+    if not is_remote_listing(
+        loc, title, description or "", remote_hint=remote_hint, extra=remote_extra
+    ):
         return None
     cat = infer_category(title, category)
     return JobListing(
         title=title[:200],
         company=company[:120],
-        location=normalize_location(location)[:120],
+        location=loc[:120],
         salary_range=(salary[:80] if salary else None),
         description=stamp_description(description, cat),
         apply_url=apply_url[:1_000],
@@ -418,6 +578,8 @@ def parse_remotive(jobs_raw: list, fallback_cat: str) -> list[JobListing]:
             description=item.get("description") or "",
             apply_url=item.get("url") or item.get("apply_url") or "",
             category=fallback_cat,
+            posted_at=item.get("publication_date") or item.get("pub_date"),
+            remote_hint=True,  # Remotive is remote-only
         )
         if listing:
             out.append(listing)
@@ -457,6 +619,9 @@ def parse_remoteok(rows: list, fallback_cat: str) -> list[JobListing]:
             description=item.get("description") or "",
             apply_url=str(apply_url),
             category=cat,
+            posted_at=item.get("date") or item.get("epoch"),
+            remote_hint=True,  # RemoteOK is remote-only
+            remote_extra=tags,
         )
         if listing:
             out.append(listing)
@@ -474,6 +639,8 @@ def parse_jobicy(jobs_raw: list, fallback_cat: str) -> list[JobListing]:
             description=item.get("jobDescription") or item.get("jobExcerpt") or "",
             apply_url=item.get("url") or item.get("jobUrl") or "",
             category=fallback_cat,
+            posted_at=item.get("pubDate") or item.get("jobPubDate"),
+            remote_hint=True,  # Jobicy remote-jobs API
         )
         if listing:
             out.append(listing)
@@ -495,14 +662,24 @@ def parse_arbeitnow(rows: list) -> list[JobListing]:
             cat = "Operations"
         else:
             continue
+        remote_hint = item.get("remote")
+        if isinstance(remote_hint, str):
+            remote_hint = remote_hint.strip().lower() in {"1", "true", "yes"}
+        elif remote_hint is not None:
+            remote_hint = bool(remote_hint)
         listing = make_listing(
             title=title,
-            company=(item.get("company_name") or item.get("company") or "Unknown"),
+            company=(item.get("company_name") or item.get("company") or ""),
             location=normalize_location(item.get("location")),
             salary=None,
             description=item.get("description") or "",
             apply_url=item.get("url") or "",
             category=cat,
+            posted_at=item.get("created_at") or item.get("published_at"),
+            remote_hint=remote_hint if remote_hint is not None else None,
+            remote_extra=" ".join(item.get("tags") or [])
+            if isinstance(item.get("tags"), list)
+            else "",
         )
         if listing:
             out.append(listing)
@@ -619,41 +796,81 @@ def scrape_all() -> list[JobListing]:
     return all_jobs
 
 
+def _url_dedupe_keys(apply_url: str) -> set[str]:
+    """Normalized URL keys used to detect duplicates across sources/runs."""
+    keys: set[str] = set()
+    norm = normalize_apply_url(apply_url)
+    if not norm:
+        return keys
+    keys.add(norm)
+    try:
+        parsed = urlparse(norm)
+        host_path = f"{parsed.netloc}{parsed.path}".lower().rstrip("/")
+        if host_path:
+            keys.add(host_path)
+    except Exception:
+        pass
+    return keys
+
+
 def deduplicate(jobs: Iterable[JobListing]) -> list[JobListing]:
+    """
+    In-memory dedupe by:
+      - fingerprint(title|company|normalized_url)
+      - normalized apply_url / host+path
+      - title|company (same role at same company)
+    """
     by_fp: dict[str, JobListing] = {}
-    by_url: set[str] = set()
+    seen_urls: set[str] = set()
+    seen_tc: set[str] = set()
     for job in jobs:
+        if not is_valid_record(job.title, job.company, job.apply_url):
+            continue
+        # Re-normalize URL onto the listing if needed
+        norm_url = normalize_apply_url(job.apply_url)
+        if norm_url != job.apply_url:
+            job = JobListing(
+                title=job.title,
+                company=job.company,
+                location=job.location,
+                salary_range=job.salary_range,
+                description=job.description,
+                apply_url=norm_url,
+                category=job.category,
+            )
         fp = job.fingerprint()
-        url_key = job.apply_url.strip().lower()
-        try:
-            parsed = urlparse(job.apply_url)
-            host_path = f"{parsed.netloc}{parsed.path}".lower().rstrip("/")
-        except Exception:
-            host_path = url_key
-        if fp in by_fp or url_key in by_url or host_path in by_url:
+        tc = job.title_company_key()
+        url_keys = _url_dedupe_keys(job.apply_url)
+        if fp in by_fp or tc in seen_tc or (url_keys & seen_urls):
             continue
         by_fp[fp] = job
-        by_url.add(url_key)
-        by_url.add(host_path)
+        seen_tc.add(tc)
+        seen_urls |= url_keys
     return list(by_fp.values())
 
 
-def fetch_existing_keys(client: Client | None = None) -> set[str]:
-    """Load existing apply_url values via supabase-py (SECRET_KEY). No browser UA."""
-    existing: set[str] = set()
+def fetch_existing_keys(
+    client: Client | None = None,
+) -> tuple[set[str], set[str]]:
+    """
+    Load existing apply_url + title|company keys from Supabase.
+    Returns (url_keys, title_company_keys).
+    """
+    existing_urls: set[str] = set()
+    existing_tc: set[str] = set()
     page_size = 1_000
     start = 0
     try:
         db = client or get_supabase_admin()
     except Exception as e:
         print(f"Error scraping target: {e}", flush=True)
-        return existing
+        return existing_urls, existing_tc
     while True:
         try:
             end = start + page_size - 1
             resp = (
                 db.table("jobs")
-                .select("apply_url")
+                .select("apply_url,title,company")
                 .range(start, end)
                 .execute()
             )
@@ -664,13 +881,64 @@ def fetch_existing_keys(client: Client | None = None) -> set[str]:
         if not isinstance(rows, list):
             break
         for row in rows:
-            url = (row.get("apply_url") or "").strip().lower()
-            if url:
-                existing.add(url)
+            existing_urls |= _url_dedupe_keys(row.get("apply_url") or "")
+            title = normalize_whitespace(row.get("title") or "").lower()
+            company = normalize_whitespace(row.get("company") or "").lower()
+            if title and company:
+                existing_tc.add(f"{title}|{company}")
         if len(rows) < page_size:
             break
         start += page_size
-    return existing
+    return existing_urls, existing_tc
+
+
+def purge_placeholder_jobs(client: Client | None = None) -> int:
+    """Delete dummy seed rows whose apply URL is example.com or a placeholder."""
+    try:
+        db = client or get_supabase_admin()
+    except Exception as e:
+        print(f"Error scraping target: {e}", flush=True)
+        return 0
+
+    ids: list[str] = []
+    page_size = 1_000
+    start = 0
+    while True:
+        try:
+            end = start + page_size - 1
+            resp = (
+                db.table("jobs")
+                .select("id,apply_url")
+                .range(start, end)
+                .execute()
+            )
+            rows = resp.data or []
+        except Exception as e:
+            print(f"Error scraping target: {e}", flush=True)
+            return 0
+        if not isinstance(rows, list):
+            break
+        for row in rows:
+            url = row.get("apply_url") or ""
+            if _PLACEHOLDER_URL_RE.search(url):
+                row_id = row.get("id")
+                if row_id:
+                    ids.append(str(row_id))
+        if len(rows) < page_size:
+            break
+        start += page_size
+
+    deleted = 0
+    batch_size = 100
+    for i in range(0, len(ids), batch_size):
+        batch = ids[i : i + batch_size]
+        try:
+            resp = db.table("jobs").delete().in_("id", batch).execute()
+            deleted += len(resp.data or batch)
+        except Exception as e:
+            print(f"Error scraping target: {e}", flush=True)
+    _log(f"[scraper] Purged {deleted} placeholder/example.com job rows")
+    return deleted
 
 
 def count_jobs(client: Client | None = None) -> int:
@@ -693,7 +961,7 @@ def to_row(job: JobListing) -> dict:
         "location": job.location,
         "salary": job.salary_range,
         "description": job.description,
-        "apply_url": job.apply_url,
+        "apply_url": normalize_apply_url(job.apply_url) or job.apply_url,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -701,39 +969,79 @@ def to_row(job: JobListing) -> dict:
 def insert_jobs(jobs: list[JobListing]) -> tuple[int, int]:
     """
     Insert new jobs via supabase-py + SECRET_KEY only.
-    Completely detached from Playwright page.evaluate() / browser fetch.
+    Validates required fields and skips URL / title+company duplicates.
     """
-    _log("[scraper] Loading existing apply_url keys from database…")
+    _log("[scraper] Loading existing apply_url / title+company keys from database…")
     try:
         db = get_supabase_admin()
     except Exception as e:
         print(f"Error scraping target: {e}", flush=True)
         return 0, len(jobs)
     try:
-        existing = fetch_existing_keys(db)
+        existing_urls, existing_tc = fetch_existing_keys(db)
     except Exception as e:
         print(f"Error scraping target: {e}", flush=True)
-        existing = set()
-    _log(f"[scraper] Found {len(existing)} existing jobs in Supabase")
-    fresh = [j for j in jobs if j.apply_url.strip().lower() not in existing]
-    skipped = len(jobs) - len(fresh)
+        existing_urls, existing_tc = set(), set()
+    _log(
+        f"[scraper] Found {len(existing_urls)} URL keys and "
+        f"{len(existing_tc)} title+company keys in Supabase"
+    )
+
+    fresh: list[JobListing] = []
+    skipped = 0
+    for job in jobs:
+        if not is_valid_record(job.title, job.company, job.apply_url):
+            skipped += 1
+            continue
+        norm_url = normalize_apply_url(job.apply_url)
+        url_keys = _url_dedupe_keys(norm_url)
+        tc = f"{job.title.strip().lower()}|{job.company.strip().lower()}"
+        if (url_keys & existing_urls) or tc in existing_tc:
+            skipped += 1
+            continue
+        if norm_url != job.apply_url:
+            job = JobListing(
+                title=job.title,
+                company=job.company,
+                location=job.location,
+                salary_range=job.salary_range,
+                description=job.description,
+                apply_url=norm_url,
+                category=job.category,
+            )
+        fresh.append(job)
+        # Prevent intra-batch duplicates in the same nightly run
+        existing_urls |= url_keys
+        existing_tc.add(tc)
+
     if not fresh:
-        _log("[scraper] No new jobs to insert (all duplicates)")
+        _log("[scraper] No new jobs to insert (all duplicates or invalid)")
         return 0, skipped
+
     rows = [to_row(j) for j in fresh]
     inserted = 0
     batch_size = 40
     for i in range(0, len(rows), batch_size):
         batch = rows[i : i + batch_size]
         try:
-            db.table("jobs").insert(batch).execute()
+            # ignore_duplicates guards races against unique apply_url index
+            db.table("jobs").upsert(batch, ignore_duplicates=True).execute()
             inserted += len(batch)
             _log(
                 f"[scraper] Successfully written batch {i // batch_size + 1} "
                 f"to database (+{len(batch)})"
             )
         except Exception as e:
-            print(f"Error scraping target: {e}", flush=True)
+            # Fallback to plain insert if upsert API mismatches
+            try:
+                db.table("jobs").insert(batch).execute()
+                inserted += len(batch)
+                _log(
+                    f"[scraper] Successfully written batch {i // batch_size + 1} "
+                    f"via insert (+{len(batch)})"
+                )
+            except Exception as e2:
+                print(f"Error scraping target: {e2} (upsert: {e})", flush=True)
     _log(f"[scraper] Successfully written {inserted} new jobs to database")
     return inserted, skipped
 
@@ -771,6 +1079,7 @@ def main() -> int:
         try:
             get_supabase_admin()
             _log("[scraper] create_client(supabase_url=…, supabase_key=…) OK")
+            purge_placeholder_jobs()
         except Exception as e:
             print(f"Error scraping target: {e}", flush=True)
             can_write = False
@@ -784,7 +1093,10 @@ def main() -> int:
             scraped = []
 
         unique = deduplicate(scraped)
-        _log(f"[scraper] Scraped {len(scraped)} → {len(unique)} after dedupe.")
+        _log(
+            f"[scraper] Scraped {len(scraped)} → {len(unique)} after filters/dedupe "
+            f"(≤{MAX_LISTING_AGE_DAYS}d, remote-only, title+company+url required)."
+        )
         _log(f"[scraper] Category mix: {category_breakdown(unique)}")
 
         if unique and can_write:
@@ -808,7 +1120,7 @@ def main() -> int:
                 print(f"Error scraping target: {e}", flush=True)
         elif unique and not can_write:
             _log(
-                f"[scraper] Scraped {len(scraped)} → {len(unique)} after dedupe "
+                f"[scraper] Scraped {len(scraped)} → {len(unique)} after filters/dedupe "
                 "(not written — SUPABASE_SECRET_KEY missing)."
             )
         else:

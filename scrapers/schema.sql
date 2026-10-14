@@ -22,6 +22,34 @@ create unique index if not exists jobs_apply_url_uidx
 create unique index if not exists jobs_apply_url_exact_uidx
   on public.jobs (apply_url);
 
+-- Reject dummy seed URLs once the table has none left.
+-- scrapers/purge_seed_jobs.sql deletes existing example.com rows first.
+do $$
+begin
+  if exists (
+    select 1
+    from public.jobs
+    where apply_url !~* '^https://'
+       or btrim(title) = ''
+       or btrim(company) = ''
+       or apply_url ~* '(example\.(com|org|net)|placeholder|localhost|127\.0\.0\.1)'
+  ) then
+    raise notice 'Skipping jobs_live_apply_url until scrapers/purge_seed_jobs.sql runs';
+    return;
+  end if;
+
+  alter table public.jobs drop constraint if exists jobs_live_apply_url;
+  alter table public.jobs
+    add constraint jobs_live_apply_url
+    check (
+      apply_url ~* '^https://'
+      and length(btrim(apply_url)) > 0
+      and length(btrim(title)) > 0
+      and length(btrim(company)) > 0
+      and apply_url !~* '(example\.(com|org|net)|placeholder|localhost|127\.0\.0\.1)'
+    );
+end $$;
+
 create table if not exists public.users (
   id uuid primary key default gen_random_uuid(),
   email text not null unique,
@@ -59,7 +87,12 @@ drop policy if exists "Public read jobs" on public.jobs;
 create policy "Public read jobs"
   on public.jobs for select
   to anon, authenticated
-  using (true);
+  using (
+    apply_url ~* '^https://'
+    and apply_url !~* '(example\.(com|org|net)|placeholder|localhost|127\.0\.0\.1)'
+    and length(btrim(title)) > 0
+    and length(btrim(company)) > 0
+  );
 
 -- Job alert lead capture (daily digest emails)
 create table if not exists public.job_alerts (

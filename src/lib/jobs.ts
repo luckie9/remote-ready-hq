@@ -38,6 +38,19 @@ export type Job = {
   social_proof?: string;
 };
 
+/** Hosts and tokens used by dummy seed rows — never shown as live listings. */
+const PLACEHOLDER_APPLY_URL =
+  /(example\.(com|org|net)\b|placeholder|localhost|127\.0\.0\.1)/i;
+
+/** True when the apply link is an absolute https URL from a real scrape. */
+export function isLiveScrapedApplyUrl(
+  url: string | null | undefined
+): boolean {
+  const value = (url ?? '').trim();
+  if (!value.toLowerCase().startsWith('https://')) return false;
+  return !PLACEHOLDER_APPLY_URL.test(value);
+}
+
 const CATEGORY_RULES: {
   category: Exclude<JobCategory, 'All'>;
   patterns: RegExp;

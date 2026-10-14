@@ -8,6 +8,7 @@ import {
   applicantsToday,
   deriveBadges,
   formatRelativeTime,
+  isLiveScrapedApplyUrl,
   lockedDomainPreview,
   minutesSince,
   socialProofLine,
@@ -48,17 +49,24 @@ export default async function Home() {
     if (error) {
       errorMessage = error.message;
     } else {
-      jobs = ((data ?? []) as Job[]).map((job) => {
-        const badges = deriveBadges(job);
-        return {
-          ...job,
-          posted_label: formatRelativeTime(job.created_at),
-          badges,
-          locked_domain: lockedDomainPreview(job.apply_url),
-          applicants_today: applicantsToday(job.id),
-          social_proof: socialProofLine(job.id, badges),
-        };
-      });
+      jobs = ((data ?? []) as Job[])
+        .filter(
+          (job) =>
+            isLiveScrapedApplyUrl(job.apply_url) &&
+            Boolean(job.title?.trim()) &&
+            Boolean(job.company?.trim())
+        )
+        .map((job) => {
+          const badges = deriveBadges(job);
+          return {
+            ...job,
+            posted_label: formatRelativeTime(job.created_at),
+            badges,
+            locked_domain: lockedDomainPreview(job.apply_url),
+            applicants_today: applicantsToday(job.id),
+            social_proof: socialProofLine(job.id, badges),
+          };
+        });
     }
   } catch (err) {
     errorMessage =

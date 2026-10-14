@@ -1,6 +1,7 @@
 import { promises as fs } from 'fs';
 import path from 'path';
 import { NextResponse } from 'next/server';
+import { isLiveScrapedApplyUrl } from '@/lib/jobs';
 import {
   createAdminSupabase,
   isMissingRelationError,
@@ -216,7 +217,12 @@ async function loadRecentJobs(): Promise<DigestJob[]> {
     throw new Error(error.message);
   }
 
-  return (data ?? []) as DigestJob[];
+  return ((data ?? []) as DigestJob[]).filter(
+    (job) =>
+      isLiveScrapedApplyUrl(job.apply_url) &&
+      Boolean(job.title?.trim()) &&
+      Boolean(job.company?.trim())
+  );
 }
 
 async function runDigest() {

@@ -7,6 +7,7 @@ import {
   formatLocation,
   formatRelativeTime,
   formatSalaryHighlight,
+  isLiveScrapedApplyUrl,
   type Job,
 } from '@/lib/jobs';
 
@@ -76,7 +77,7 @@ async function loadAppliedJobs(userId: string): Promise<
     return (data ?? [])
       .map((row) => {
         const job = Array.isArray(row.jobs) ? row.jobs[0] : row.jobs;
-        if (!job) return null;
+        if (!job || !isLiveScrapedApplyUrl(job.apply_url)) return null;
         return { job, applied_at: rowTimestamp(row) };
       })
       .filter(Boolean) as { job: Job; applied_at: string }[];
