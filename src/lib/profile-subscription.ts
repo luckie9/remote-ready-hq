@@ -275,18 +275,24 @@ export async function loadProfileSubscription(
   return INACTIVE;
 }
 
-export async function loadBillingCustomerId(
+export async function loadBillingTarget(
   session: SupabaseClient,
   userId: string,
   email: string
-): Promise<string | null> {
+): Promise<{ customerId: string | null; subscriptionId: string | null }> {
   const normalized = email.trim().toLowerCase();
   const row = await readSubscriptionRow(session, userId, normalized);
-  if (row?.stripe_customer_id?.startsWith('cus_')) return row.stripe_customer_id;
   const { sub, customerId } = await stripeSubscriptionFor(row, normalized);
-  if (customerId?.startsWith('cus_')) return customerId;
-  if (sub && typeof sub.customer === 'string' && sub.customer.startsWith('cus_')) {
-    return sub.customer;
-  }
-  return null;
+  const resolvedCustomer =
+    (row?.stripe_customer_id?.startsWith('cus_') && row.stripe_customer_id) ||
+    (customerId?.startsWith('cus_') && customerId) ||
+    (typeof sub?.customer === 'string' && sub.customer.startsWith('cus_')
+      ? sub.customer
+      : null);
+  const subscriptionId = sub?.id?.startsWith('sub_')
+    ? sub.id
+    : row?.stripe_subscription_id?.startsWith('sub_')
+      ? row.stripe_subscription_id
+      : null;
+  return { customerId: resolvedCustomer || null, subscriptionId };
 }

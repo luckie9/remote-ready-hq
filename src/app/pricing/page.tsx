@@ -1,4 +1,5 @@
 import Link from 'next/link';
+import { CancelSubscriptionLink } from '@/components/CancelSubscriptionLink';
 import { CheckoutButton } from '@/components/CheckoutButton';
 import { getEffectiveSubscriberSession } from '@/lib/subscription';
 
@@ -27,7 +28,15 @@ export default async function PricingPage({
             Unlock direct employer links
           </h1>
           <p className="mt-3 text-zinc-500">
-            $1.97 3-Day All-Access Trial, then $13.97/month. Cancel anytime.
+            $1.97 3-Day All-Access Trial, then $13.97/month.{' '}
+            {session ? (
+              <CancelSubscriptionLink
+                label="Cancel anytime."
+                className="font-normal text-zinc-400 underline decoration-zinc-300 underline-offset-2 transition hover:text-zinc-500 disabled:opacity-60"
+              />
+            ) : (
+              'Cancel anytime.'
+            )}
           </p>
         </header>
 

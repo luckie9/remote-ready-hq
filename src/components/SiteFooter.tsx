@@ -1,6 +1,7 @@
 'use client';
 
 import Link from 'next/link';
+import { CancelSubscriptionLink } from '@/components/CancelSubscriptionLink';
 import { JobAlertForm } from '@/components/JobAlertForm';
 import { useAuth } from '@/components/AuthProvider';
 
@@ -40,7 +41,14 @@ export function SiteFooter() {
               Contact
             </a>
           </nav>
-          <p className="text-xs text-slate-600">Curated remote roles</p>
+          <p className="flex flex-col items-center gap-2 text-xs text-slate-600 sm:items-end">
+            <span>Curated remote roles</span>
+            <CancelSubscriptionLink
+              whenActive
+              label="Cancel subscription"
+              className="text-xs font-normal text-slate-600 underline decoration-slate-700 underline-offset-2 transition hover:text-slate-400 disabled:opacity-60"
+            />
+          </p>
         </div>
       </div>
     </footer>
