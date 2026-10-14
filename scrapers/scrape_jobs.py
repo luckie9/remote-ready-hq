@@ -8,20 +8,16 @@ Stamps rrhq_category into description for accurate frontend pill counts.
 
 from __future__ import annotations
 
-import base64
 import hashlib
-import html
-import json
 import os
 import re
 import sys
-import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Callable, Iterable
-from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
+from typing import Iterable
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
@@ -357,7 +353,7 @@ def normalize_apply_url(raw: str | None) -> str:
     return urlunparse(("https", host, path, "", query, ""))
 
 
-# Hosts that are job boards / aggregators, not employer application portals.
+# Listing sites. Apply links on these hosts route through the aggregator and are dropped.
 _AGGREGATOR_HOSTS = (
     "remotive.com",
     "remoteok.com",
@@ -379,13 +375,17 @@ _AGGREGATOR_HOSTS = (
     "builtin.com",
     "himalayas.app",
     "workingnomads.com",
+    "nodesk.co",
+    "dynamitejobs.com",
+    "workingnomads.co",
 )
-# Applicant-tracking and company career hosts worth keeping.
+# Native applicant-tracking systems. A link is direct only when the listing already has this host.
 _ATS_HOSTS = (
     "greenhouse.io",
     "lever.co",
     "ashbyhq.com",
     "myworkdayjobs.com",
+    "myworkday.com",
     "smartrecruiters.com",
     "workable.com",
     "bamboohr.com",
@@ -398,7 +398,6 @@ _ATS_HOSTS = (
     "personio.com",
     "personio.de",
     "pinpointhq.com",
-    "join.com",
     "rippling.com",
     "dover.io",
     "gem.com",
@@ -429,29 +428,16 @@ _NOISE_HOSTS = (
     "play.google.com",
     "apps.apple.com",
 )
+_CAREER_HOST_PREFIXES = ("jobs.", "job.", "careers.", "career.", "apply.", "recruiting.", "talent.")
 _CAREER_PATH_RE = re.compile(
-    r"/(apply|application|careers?|jobs?|positions?|openings?|opportunit(?:y|ies)?)/",
+    r"/(apply|application|careers?|jobs?|positions?|openings?|opportunit(?:y|ies)?|vacanc(?:y|ies))(/|$)",
     re.I,
 )
 _NOISE_PATH_RE = re.compile(
-    r"/(privacy|terms|blog|login|sign-?up|signup|cookie|about|wp-content|static/)",
+    r"/(privacy|terms|blog|login|sign-?up|signup|cookie|about|wp-content|static/)(/|$)",
     re.I,
 )
-_ANCHOR_RE = re.compile(
-    r"<a\b[^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>",
-    re.I | re.S,
-)
-_META_REFRESH_RE = re.compile(
-    r"http-equiv=[\"']refresh[\"'][^>]*content=[\"'][^\"']*url=([^\"'>\s]+)",
-    re.I,
-)
-_JSONLD_RE = re.compile(
-    r"<script[^>]*type=[\"']application/ld\+json[\"'][^>]*>(.*?)</script>",
-    re.I | re.S,
-)
-_MIN_APPLY_SCORE = 40
-_APPLY_PAGE_CACHE: dict[str, tuple[str, str]] = {}
-_APPLY_RESOLVE_STATS = {"direct": 0, "resolved": 0, "unresolved": 0}
+_APPLY_LINK_STATS = {"kept": 0, "skipped_aggregator": 0}
 
 
 def _host_name(url: str) -> str:
@@ -469,11 +455,16 @@ def _host_is(host: str, roots: tuple[str, ...]) -> bool:
 
 
 def is_aggregator_url(url: str) -> bool:
-    """True for listing-site pages rather than an employer application portal."""
+    """True when the link stays on a job board instead of the employer portal."""
     host = _host_name(url)
     if not host:
         return False
-    if host == "arbeitnow.com" or host.endswith(".arbeitnow.com") or host.startswith("arbeitnow."):
+    if (
+        host == "arbeitnow.com"
+        or host.endswith(".arbeitnow.com")
+        or host.startswith("arbeitnow.")
+        or ".arbeitnow." in f".{host}."
+    ):
         return True
     return _host_is(host, _AGGREGATOR_HOSTS)
 
@@ -492,251 +483,87 @@ def _safe_public_http(url: str) -> bool:
     return True
 
 
-def score_apply_url(url: str, anchor_text: str = "") -> int:
-    """Higher scores are employer career / ATS links. Aggregator pages score 0."""
+def _is_ats_host(host: str) -> bool:
+    return _host_is(host, _ATS_HOSTS)
+
+
+def _is_career_host(host: str) -> bool:
+    return host.startswith(_CAREER_HOST_PREFIXES)
+
+
+def is_direct_employer_apply_url(url: str) -> bool:
+    """
+    True for a native employer career page, ATS, or official company application URL.
+
+    Aggregator hosts are rejected. This does not follow redirects, so a board URL
+    that would bounce to Greenhouse or Lever is still rejected.
+    """
     norm = normalize_apply_url(url)
     if not norm or not _safe_public_http(norm):
-        return 0
+        return False
     if _PLACEHOLDER_URL_RE.search(norm) or is_aggregator_url(norm):
-        return 0
+        return False
     host = _host_name(norm)
-    if _host_is(host, _NOISE_HOSTS):
-        return 0
+    if not host or _host_is(host, _NOISE_HOSTS):
+        return False
     path = urlparse(norm).path or "/"
-    score = 20
-    if _host_is(host, _ATS_HOSTS):
-        score += 80
-    if _CAREER_PATH_RE.search(path if path.endswith("/") else path + "/"):
-        score += 40
-    if path in {"", "/"}:
-        score += 5
-    if _NOISE_PATH_RE.search(path if path.endswith("/") else path + "/"):
-        score -= 50
-    if re.search(r"\bapply\b", anchor_text or "", re.I):
-        score += 25
-    return score
+    path_slash = path if path.endswith("/") else path + "/"
+    if _NOISE_PATH_RE.search(path_slash):
+        return False
+    if _is_ats_host(host) or _is_career_host(host):
+        return True
+    if _CAREER_PATH_RE.search(path_slash):
+        return True
+    # Official company domain with a specific path (not the bare marketing homepage).
+    return path not in {"", "/"}
 
 
-def _best_apply_url(candidates: Iterable[tuple[str, str]]) -> str:
-    best = ""
-    best_score = 0
-    for raw, text in candidates:
-        norm = normalize_apply_url(raw)
-        score = score_apply_url(norm, text)
-        if score > best_score:
-            best = norm
-            best_score = score
-    if best_score >= _MIN_APPLY_SCORE:
-        return best
-    return ""
+def _direct_apply_rank(url: str) -> int:
+    """Prefer ATS, then career pages, then other official company URLs."""
+    if not is_direct_employer_apply_url(url):
+        return 0
+    host = _host_name(url)
+    path = urlparse(url).path or "/"
+    path_slash = path if path.endswith("/") else path + "/"
+    if _is_ats_host(host):
+        return 300
+    if _is_career_host(host) or _CAREER_PATH_RE.search(path_slash):
+        return 200
+    return 100
 
 
-def _expand_board_urls(url: str) -> list[str]:
-    """Prefer known apply endpoints on aggregator listings before the listing itself."""
-    norm = normalize_apply_url(url)
-    if not norm:
-        return []
-    ordered = [norm]
-    host = _host_name(norm)
-    path = urlparse(norm).path or ""
-    if host.startswith("arbeitnow.") or host.endswith("arbeitnow.com"):
-        if not path.rstrip("/").endswith("/apply"):
-            ordered.insert(0, norm.rstrip("/") + "/apply")
-    if host.endswith("remoteok.com") and "/l/" not in path:
-        match = re.search(r"-(\d+)$", path.rstrip("/"))
-        if match:
-            ordered.insert(0, f"https://remoteok.com/l/{match.group(1)}")
-    deduped: list[str] = []
-    for item in ordered:
-        if item not in deduped:
-            deduped.append(item)
-    return deduped
-
-
-def _b64_decode(value: str) -> bytes:
-    pad = "=" * ((4 - len(value) % 4) % 4)
-    return base64.b64decode(value + pad)
-
-
-def _decode_embedded_redirect(page_html: str) -> str:
+def select_direct_apply_url(*candidates: str, description: str = "") -> str:
     """
-    Some board interstitial pages hide the next URL in a short script that
-    assigns window.location.href. Return an absolute http(s) destination.
+    Choose an apply URL that is already a direct employer or ATS link.
+
+    Job-board URLs (Jobicy, Arbeitnow, Remotive, RemoteOK, and similar) are
+    skipped. Redirects on those hosts are not followed.
     """
-    if "window.location.href" not in page_html or "atob" not in page_html:
-        return ""
-    match = re.search(r"n='([^']+)'.*?split\('([^']+)'\)", page_html, re.S)
-    if not match:
-        return ""
-    blob, marker = match.group(1), match.group(2)
-    if marker not in blob:
-        return ""
-    try:
-        step = blob.split(marker)[1]
-        first = _b64_decode(step[::-1]).decode("latin1")
-        part = first[::-1].split(marker)[1]
-        decoded = _b64_decode(part).decode("utf-8", "replace")
-        dest = decoded.split(marker)[1].strip()
-    except Exception:
-        return ""
-    if dest.startswith("http://") or dest.startswith("https://"):
-        return dest
-    return ""
-
-
-def _jsonld_urls(page_html: str) -> list[str]:
-    found: list[str] = []
-
-    def walk(node: object) -> None:
-        if isinstance(node, list):
-            for item in node:
-                walk(item)
-            return
-        if not isinstance(node, dict):
-            return
-        org = node.get("hiringOrganization")
-        if isinstance(org, dict):
-            for key in ("url", "sameAs"):
-                value = org.get(key)
-                if isinstance(value, str):
-                    found.append(value)
-                elif isinstance(value, list):
-                    found.extend(item for item in value if isinstance(item, str))
-        for value in node.values():
-            if isinstance(value, (dict, list)):
-                walk(value)
-
-    for raw in _JSONLD_RE.findall(page_html):
-        try:
-            walk(json.loads(html.unescape(raw.strip())))
-        except Exception:
-            continue
-    return found
-
-
-def _extract_page_candidates(page_html: str, page_url: str) -> list[tuple[str, str]]:
-    candidates: list[tuple[str, str]] = []
-    for raw in _META_REFRESH_RE.findall(page_html):
-        candidates.append((urljoin(page_url, html.unescape(raw.strip())), ""))
-    for raw in _jsonld_urls(page_html):
-        candidates.append((urljoin(page_url, raw.strip()), ""))
-    for href, inner in _ANCHOR_RE.findall(page_html)[:250]:
-        text = re.sub(r"<[^>]+>", " ", inner)
-        text = re.sub(r"\s+", " ", html.unescape(text)).strip()
-        candidates.append((urljoin(page_url, html.unescape(href.strip())), text))
-    return candidates
-
-
-def _fetch_apply_page(url: str) -> tuple[str, str]:
-    """GET a public listing/apply URL. Returns (final_url, html)."""
-    cached = _APPLY_PAGE_CACHE.get(url)
-    if cached is not None:
-        return cached
-    if not _safe_public_http(url):
-        _APPLY_PAGE_CACHE[url] = ("", "")
-        return "", ""
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": BROWSER_UA,
-            "Accept": "text/html,application/xhtml+xml",
-            "Accept-Language": "en-US,en;q=0.9",
-        },
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=12) as response:
-            final = response.geturl()
-            body = response.read(400_000).decode("utf-8", "replace")
-    except Exception:
-        final, body = "", ""
-    _APPLY_PAGE_CACHE[url] = (final, body)
-    return final, body
-
-
-def _same_site_apply_link(page_url: str, candidates: list[tuple[str, str]]) -> str:
-    for href, _text in candidates:
-        absolute = normalize_apply_url(urljoin(page_url, href))
-        if not absolute or not is_aggregator_url(absolute):
-            continue
-        path = (urlparse(absolute).path or "").lower()
-        if path.rstrip("/").endswith("/apply"):
-            return absolute
-    return ""
-
-
-def _unwrap_board_url(
-    url: str,
-    fetch: Callable[[str], tuple[str, str]],
-    depth: int = 0,
-) -> str:
-    if depth > 1 or not _safe_public_http(url):
-        return ""
-    try:
-        final, body = fetch(url)
-    except Exception:
-        return ""
-    final_norm = normalize_apply_url(final)
-    if score_apply_url(final_norm) >= _MIN_APPLY_SCORE:
-        return final_norm
-    embedded = _decode_embedded_redirect(body or "")
-    if embedded and score_apply_url(embedded) >= _MIN_APPLY_SCORE:
-        return normalize_apply_url(embedded)
-    page_url = final_norm or url
-    candidates = _extract_page_candidates(body or "", page_url)
-    best = _best_apply_url(candidates)
-    if best:
-        return best
-    apply_link = _same_site_apply_link(page_url, candidates)
-    if apply_link and apply_link != url:
-        return _unwrap_board_url(apply_link, fetch, depth + 1)
-    return ""
-
-
-def resolve_employer_apply_url(
-    *candidates: str,
-    description: str = "",
-    fetch: Callable[[str], tuple[str, str]] | None = None,
-) -> str:
-    """
-    Pick a company application URL.
-
-    Direct ATS / career links in the payload win. Aggregator listing pages are
-    followed only far enough to read a redirect or an embedded employer URL.
-    """
-    fetch_fn = fetch or _fetch_apply_page
-    direct: list[tuple[str, str]] = []
-    boards: list[str] = []
-    for raw in candidates:
-        norm = normalize_apply_url(raw)
-        if not norm:
-            continue
-        if is_aggregator_url(norm):
-            if norm not in boards:
-                boards.append(norm)
-        else:
-            direct.append((norm, ""))
+    raw_values = [value for value in candidates if value]
     for match in re.findall(r"https?://[^\s\"'<>]+", description or ""):
-        cleaned = match.rstrip(").,;")
-        norm = normalize_apply_url(cleaned)
-        if norm and not is_aggregator_url(norm):
-            direct.append((norm, ""))
-    chosen = _best_apply_url(direct)
-    if chosen:
-        _APPLY_RESOLVE_STATS["direct"] += 1
-        return chosen
+        raw_values.append(match.rstrip(").,;"))
 
-    attempts: list[str] = []
-    for board in boards:
-        for extra in _expand_board_urls(board):
-            if extra not in attempts:
-                attempts.append(extra)
-    for url in attempts[:3]:
-        resolved = _unwrap_board_url(url, fetch_fn)
-        if resolved:
-            _APPLY_RESOLVE_STATS["resolved"] += 1
-            return resolved
-    if boards:
-        _APPLY_RESOLVE_STATS["unresolved"] += 1
+    best = ""
+    best_rank = 0
+    saw_aggregator = False
+    seen: set[str] = set()
+    for raw in raw_values:
+        norm = normalize_apply_url(raw)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        if is_aggregator_url(norm):
+            saw_aggregator = True
+            continue
+        rank = _direct_apply_rank(norm)
+        if rank > best_rank:
+            best = norm
+            best_rank = rank
+    if best:
+        _APPLY_LINK_STATS["kept"] += 1
+        return best
+    if saw_aggregator:
+        _APPLY_LINK_STATS["skipped_aggregator"] += 1
     return ""
 
 
@@ -813,7 +640,7 @@ def is_remote_listing(
 
 
 def is_valid_record(title: str, company: str, apply_url: str) -> bool:
-    """Require title, company, and a direct employer application link."""
+    """Require title, company, and a direct employer or ATS apply link."""
     t = normalize_whitespace(title)
     c = normalize_whitespace(company)
     u = normalize_apply_url(apply_url)
@@ -821,11 +648,7 @@ def is_valid_record(title: str, company: str, apply_url: str) -> bool:
         return False
     if c.lower() in _PLACEHOLDER_COMPANY:
         return False
-    if _PLACEHOLDER_URL_RE.search(u) or is_aggregator_url(u):
-        return False
-    if score_apply_url(u) < _MIN_APPLY_SCORE:
-        return False
-    return True
+    return is_direct_employer_apply_url(u)
 
 
 BROWSER_UA = (
@@ -965,7 +788,7 @@ def parse_remotive(jobs_raw: list, fallback_cat: str) -> list[JobListing]:
             ),
             salary=salary,
             description=item.get("description") or "",
-            apply_url=resolve_employer_apply_url(
+            apply_url=select_direct_apply_url(
                 item.get("apply_url") or "",
                 item.get("url") or "",
                 description=item.get("description") or "",
@@ -985,14 +808,9 @@ def parse_remoteok(rows: list, fallback_cat: str) -> list[JobListing]:
         if not isinstance(item, dict):
             continue
         title = item.get("position") or item.get("title") or ""
-        apply_candidates = [
+        apply_url = select_direct_apply_url(
             item.get("apply_url") or "",
             item.get("url") or "",
-        ]
-        if item.get("id"):
-            apply_candidates.insert(0, f"https://remoteok.com/l/{item['id']}")
-        apply_url = resolve_employer_apply_url(
-            *apply_candidates,
             description=item.get("description") or "",
         )
         salary = None
@@ -1035,7 +853,7 @@ def parse_jobicy(jobs_raw: list, fallback_cat: str) -> list[JobListing]:
             location=normalize_location(item.get("jobGeo") or "Worldwide / Remote"),
             salary=None,
             description=item.get("jobDescription") or item.get("jobExcerpt") or "",
-            apply_url=resolve_employer_apply_url(
+            apply_url=select_direct_apply_url(
                 item.get("jobUrl") or "",
                 item.get("url") or "",
                 description=(item.get("jobDescription") or "")
@@ -1077,7 +895,7 @@ def parse_arbeitnow(rows: list) -> list[JobListing]:
             location=normalize_location(item.get("location")),
             salary=None,
             description=item.get("description") or "",
-            apply_url=resolve_employer_apply_url(
+            apply_url=select_direct_apply_url(
                 item.get("url") or "",
                 description=item.get("description") or "",
             ),
@@ -1201,10 +1019,9 @@ def scrape_all() -> list[JobListing]:
             browser.close()
     _log(f"[scraper] Fetching complete — raw total {len(all_jobs)} jobs")
     _log(
-        "[scraper] Apply links: "
-        f"direct={_APPLY_RESOLVE_STATS['direct']} "
-        f"resolved={_APPLY_RESOLVE_STATS['resolved']} "
-        f"unresolved_board_pages={_APPLY_RESOLVE_STATS['unresolved']}"
+        "[scraper] Direct employer apply links: "
+        f"kept={_APPLY_LINK_STATS['kept']} "
+        f"skipped_aggregator={_APPLY_LINK_STATS['skipped_aggregator']}"
     )
     return all_jobs
 
@@ -1403,7 +1220,11 @@ def insert_jobs(jobs: list[JobListing]) -> tuple[int, int]:
     fresh: list[JobListing] = []
     skipped = 0
     for job in jobs:
-        if not is_valid_record(job.title, job.company, job.apply_url):
+        # Drop aggregator pages and any link that is not already an employer/ATS URL.
+        # Redirects through Jobicy, Arbeitnow, and similar boards are not followed.
+        if not is_direct_employer_apply_url(job.apply_url) or not is_valid_record(
+            job.title, job.company, job.apply_url
+        ):
             skipped += 1
             continue
         norm_url = normalize_apply_url(job.apply_url)
