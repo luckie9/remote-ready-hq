@@ -1,6 +1,10 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type Stripe from 'stripe';
 import { getStripe, PLAN_AMOUNTS } from '@/lib/stripe';
+import {
+  findStripeCustomerByEmail,
+  saveStripeCustomerLink,
+} from '@/lib/stripe-mapping';
 import { createAdminSupabase } from '@/lib/supabase';
 import {
   getSubscriberSession,
@@ -162,19 +166,13 @@ async function stripeSubscriptionFor(
   }
 
   try {
-    const listed = await stripe.customers.list({ email, limit: 1 });
-    const customer = listed.data[0];
-    if (!customer) return { sub: null, customerId: rowCustomer };
-    const subs = await stripe.subscriptions.list({
-      customer: customer.id,
-      status: 'all',
-      limit: 5,
-    });
-    const current =
-      subs.data.find((item) => item.status === 'trialing') ||
-      subs.data.find((item) => item.status === 'active') ||
-      null;
-    return { sub: current, customerId: customer.id };
+    const found = await findStripeCustomerByEmail(email);
+    if (!found) return { sub: null, customerId: rowCustomer };
+    if (!found.subscriptionId) {
+      return { sub: null, customerId: found.customerId };
+    }
+    const sub = await stripe.subscriptions.retrieve(found.subscriptionId);
+    return { sub, customerId: found.customerId };
   } catch {
     return { sub: null, customerId: rowCustomer };
   }
@@ -294,5 +292,20 @@ export async function loadBillingTarget(
     : row?.stripe_subscription_id?.startsWith('sub_')
       ? row.stripe_subscription_id
       : null;
+
+  if (
+    resolvedCustomer &&
+    row?.stripe_customer_id !== resolvedCustomer
+  ) {
+    await saveStripeCustomerLink({
+      email: normalized,
+      authUserId: userId,
+      customerId: resolvedCustomer,
+      subscriptionId,
+      status: sub?.status || row?.status || 'active',
+      plan: row?.plan ?? null,
+    });
+  }
+
   return { customerId: resolvedCustomer || null, subscriptionId };
 }

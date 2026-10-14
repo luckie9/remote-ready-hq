@@ -1,5 +1,8 @@
 import { getStripe, PLAN_AMOUNTS } from '@/lib/stripe';
-import { createAdminSupabase } from '@/lib/supabase';
+import {
+  findStripeCustomerByEmail,
+  saveStripeCustomerLink,
+} from '@/lib/stripe-mapping';
 import type { SubscriberSession } from '@/lib/subscription';
 
 export type CheckoutFulfillment = {
@@ -65,96 +68,34 @@ export async function fulfillCheckoutSession(
       ? Date.now() + PLAN_AMOUNTS.trialDays * 24 * 60 * 60 * 1000
       : Date.now() + 7 * 24 * 60 * 60 * 1000;
 
+  const customerFromSession =
+    typeof session.customer === 'string'
+      ? session.customer
+      : session.customer?.id ?? null;
+  const linePriceId =
+    session.line_items?.data?.[0]?.price &&
+    typeof session.line_items.data[0].price === 'object'
+      ? session.line_items.data[0].price.id
+      : null;
+
+  let customerId = customerFromSession;
+  let subscriptionId = subscription?.id ?? null;
+  if (!customerId || !subscriptionId) {
+    const found = await findStripeCustomerByEmail(email.toLowerCase());
+    customerId = customerId || found?.customerId || null;
+    subscriptionId = subscriptionId || found?.subscriptionId || null;
+  }
+
   try {
-    const admin = createAdminSupabase();
-    const normalized = email.toLowerCase();
-    const customerId =
-      typeof session.customer === 'string' ? session.customer : null;
-    const linePriceId =
-      session.line_items?.data?.[0]?.price &&
-      typeof session.line_items.data[0].price === 'object'
-        ? session.line_items.data[0].price.id
-        : null;
-
-    const { data: existingUser } = await admin
-      .from('users')
-      .select('id')
-      .eq('email', normalized)
-      .maybeSingle();
-
-    const unlockExpiresAt = new Date(exp).toISOString();
-    const userPayload: Record<string, unknown> = {
-      email: normalized,
-      stripe_customer_id: customerId,
-      updated_at: new Date().toISOString(),
-      active_subscriber: true,
-      unlock_expires_at: unlockExpiresAt,
-    };
-
-    let userId = existingUser?.id as string | undefined;
-    if (!userId) {
-      const { data: created, error: createErr } = await admin
-        .from('users')
-        .insert(userPayload)
-        .select('id')
-        .single();
-      if (createErr) {
-        const { data: createdFallback } = await admin
-          .from('users')
-          .insert({
-            email: normalized,
-            stripe_customer_id: customerId,
-            updated_at: new Date().toISOString(),
-          })
-          .select('id')
-          .single();
-        userId = createdFallback?.id;
-      } else {
-        userId = created?.id;
-      }
-    } else {
-      const { error: updateErr } = await admin
-        .from('users')
-        .update(userPayload)
-        .eq('id', userId);
-      if (updateErr) {
-        await admin
-          .from('users')
-          .update({
-            stripe_customer_id: customerId,
-            updated_at: new Date().toISOString(),
-          })
-          .eq('id', userId);
-      }
-    }
-
-    if (userId) {
-      const subId = subscription?.id ?? (isPaymentMode ? session.id : null);
-      if (subId) {
-        const { data: existingSub } = await admin
-          .from('subscriptions')
-          .select('id')
-          .eq('stripe_subscription_id', subId)
-          .maybeSingle();
-        const row = {
-          user_id: userId,
-          email: normalized,
-          stripe_customer_id: customerId,
-          stripe_subscription_id: subId,
-          stripe_price_id:
-            subscription?.items?.data?.[0]?.price?.id ?? linePriceId,
-          status,
-          plan,
-          current_period_end: new Date(exp).toISOString(),
-          updated_at: new Date().toISOString(),
-        };
-        if (existingSub?.id) {
-          await admin.from('subscriptions').update(row).eq('id', existingSub.id);
-        } else {
-          await admin.from('subscriptions').insert(row);
-        }
-      }
-    }
+    await saveStripeCustomerLink({
+      email,
+      customerId,
+      subscriptionId,
+      status,
+      plan,
+      priceId: subscription?.items?.data?.[0]?.price?.id ?? linePriceId,
+      currentPeriodEnd: new Date(exp).toISOString(),
+    });
   } catch {
     // Cookie entitlement still unlocks apply links locally.
   }

@@ -1,5 +1,5 @@
 import { getStripe } from '@/lib/stripe';
-import { createAdminSupabase } from '@/lib/supabase';
+import { saveStripeCustomerLink, findStripeCustomerByEmail } from '@/lib/stripe-mapping';
 import type Stripe from 'stripe';
 
 export const runtime = 'nodejs';
@@ -13,100 +13,17 @@ async function upsertSubscriber(params: {
   plan: string;
   currentPeriodEnd?: number | null;
 }) {
-  const admin = createAdminSupabase();
-  const email = params.email.toLowerCase();
-
-  const { data: existingUser } = await admin
-    .from('users')
-    .select('id')
-    .eq('email', email)
-    .maybeSingle();
-
-  const unlocked =
-    params.status === 'active' ||
-    params.status === 'trialing' ||
-    params.status === 'paid';
-  const unlockExpiresAt = params.currentPeriodEnd
-    ? new Date(params.currentPeriodEnd * 1000).toISOString()
-    : unlocked
-      ? new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString()
-      : null;
-
-  const userPayload: Record<string, unknown> = {
-    email,
-    stripe_customer_id: params.stripeCustomerId ?? null,
-    updated_at: new Date().toISOString(),
-    active_subscriber: unlocked,
-    unlock_expires_at: unlockExpiresAt,
-  };
-
-  let userId = existingUser?.id as string | undefined;
-  if (!userId) {
-    const { data: created, error } = await admin
-      .from('users')
-      .insert(userPayload)
-      .select('id')
-      .single();
-    if (error) {
-      // Retry without unlock columns if schema not migrated yet
-      const { data: createdFallback, error: fallbackErr } = await admin
-        .from('users')
-        .insert({
-          email,
-          stripe_customer_id: params.stripeCustomerId ?? null,
-          updated_at: new Date().toISOString(),
-        })
-        .select('id')
-        .single();
-      if (fallbackErr) throw fallbackErr;
-      userId = createdFallback.id;
-    } else {
-      userId = created.id;
-    }
-  } else {
-    const { error: updateErr } = await admin
-      .from('users')
-      .update(userPayload)
-      .eq('id', userId);
-    if (updateErr) {
-      await admin
-        .from('users')
-        .update({
-          stripe_customer_id: params.stripeCustomerId ?? null,
-          updated_at: new Date().toISOString(),
-        })
-        .eq('id', userId);
-    }
-  }
-
-  const row = {
-    user_id: userId,
-    email,
-    stripe_customer_id: params.stripeCustomerId ?? null,
-    stripe_subscription_id: params.stripeSubscriptionId ?? null,
-    stripe_price_id: params.stripePriceId ?? null,
+  await saveStripeCustomerLink({
+    email: params.email,
+    customerId: params.stripeCustomerId ?? null,
+    subscriptionId: params.stripeSubscriptionId ?? null,
     status: params.status,
     plan: params.plan,
-    current_period_end: params.currentPeriodEnd
+    priceId: params.stripePriceId ?? null,
+    currentPeriodEnd: params.currentPeriodEnd
       ? new Date(params.currentPeriodEnd * 1000).toISOString()
       : null,
-    updated_at: new Date().toISOString(),
-  };
-
-  if (params.stripeSubscriptionId) {
-    const { data: existingSub } = await admin
-      .from('subscriptions')
-      .select('id')
-      .eq('stripe_subscription_id', params.stripeSubscriptionId)
-      .maybeSingle();
-
-    if (existingSub?.id) {
-      await admin.from('subscriptions').update(row).eq('id', existingSub.id);
-      return;
-    }
-  }
-
-  await admin.from('subscriptions').insert(row);
+  });
 }
 
 function periodEndFromSubscription(sub: Stripe.Subscription): number | null {
@@ -157,34 +74,38 @@ export async function POST(request: Request) {
             : session.subscription?.id ?? null;
         let currentPeriodEnd: number | null = null;
         let priceId: string | null = null;
+        let stripeCustomerId =
+          typeof session.customer === 'string'
+            ? session.customer
+            : session.customer?.id ?? null;
 
-        if (stripeSubscriptionId) {
+        if (stripeSubscriptionId?.startsWith('sub_')) {
           const sub = await stripe.subscriptions.retrieve(stripeSubscriptionId);
           status = sub.status;
           plan = planFromSubscription(sub);
           currentPeriodEnd = periodEndFromSubscription(sub);
           priceId = sub.items.data[0]?.price?.id ?? null;
+          const customer =
+            typeof sub.customer === 'string' ? sub.customer : sub.customer?.id;
+          stripeCustomerId = stripeCustomerId || customer || null;
         } else if (session.mode === 'payment') {
-          // One-time $1.97 pass — grant a 3-day access window
           status = 'trialing';
           plan = 'trial';
           currentPeriodEnd =
             Math.floor(Date.now() / 1000) + 3 * 24 * 60 * 60;
-          stripeSubscriptionId = session.id;
-          const full = await stripe.checkout.sessions.retrieve(session.id, {
-            expand: ['line_items'],
-          });
-          const linePrice = full.line_items?.data?.[0]?.price;
-          priceId =
-            linePrice && typeof linePrice === 'object' ? linePrice.id : null;
+          stripeSubscriptionId = null;
+        }
+
+        if (!stripeCustomerId || !stripeSubscriptionId) {
+          const found = await findStripeCustomerByEmail(email);
+          stripeCustomerId = stripeCustomerId || found?.customerId || null;
+          stripeSubscriptionId = stripeSubscriptionId || found?.subscriptionId || null;
+          if (found?.status) status = found.status;
         }
 
         await upsertSubscriber({
           email,
-          stripeCustomerId:
-            typeof session.customer === 'string'
-              ? session.customer
-              : session.customer?.id ?? null,
+          stripeCustomerId,
           stripeSubscriptionId,
           stripePriceId: priceId,
           status,

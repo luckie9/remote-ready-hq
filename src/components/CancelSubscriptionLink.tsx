@@ -38,11 +38,7 @@ export function CancelSubscriptionLink({
     setBusy(true);
     setError('');
     try {
-      const res = await fetch('/api/subscription/portal', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ intent: 'cancel' }),
-      });
+      const res = await fetch('/api/cancel-subscription', { method: 'POST' });
       const data = (await res.json()) as { url?: string; error?: string };
       if (!res.ok || !data.url) {
         throw new Error(data.error || 'Unable to open cancellation');

@@ -111,6 +111,7 @@ export async function POST(request: Request) {
         ? {
             mode: 'payment',
             customer_email: email || undefined,
+            customer_creation: 'always',
             line_items: [{ price: primaryPriceId, quantity: 1 }],
             success_url: successUrl,
             cancel_url: cancelUrl,
