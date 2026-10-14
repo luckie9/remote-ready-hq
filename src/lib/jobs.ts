@@ -20,7 +20,12 @@ export const JOB_CATEGORIES: JobCategory[] = [
   'Product',
 ];
 
-export type JobBadge = 'HOT' | 'FEATURED' | 'DIRECT_APPLY' | 'SALARY_VERIFIED';
+export type JobBadge =
+  | 'HOT'
+  | 'FEATURED'
+  | 'DIRECT_APPLY'
+  | 'CURATED_LINK'
+  | 'SALARY_VERIFIED';
 
 export type Job = {
   id: string;
@@ -345,13 +350,68 @@ export function hashCode(input: string): number {
   return Math.abs(h);
 }
 
+/** Hosts that are job boards, not the employer's own career site or ATS. */
+const AGGREGATOR_APPLY_HOSTS = [
+  'remotive.com',
+  'remoteok.com',
+  'remoteok.io',
+  'rok.co',
+  'jobicy.com',
+  'jobi.cy',
+  'weworkremotely.com',
+  'remote.co',
+  'flexjobs.com',
+  'indeed.com',
+  'linkedin.com',
+  'ziprecruiter.com',
+  'glassdoor.com',
+  'monster.com',
+  'simplyhired.com',
+  'wellfound.com',
+  'otta.com',
+  'builtin.com',
+  'himalayas.app',
+  'workingnomads.com',
+  'nodesk.co',
+  'dynamitejobs.com',
+] as const;
+
+function applyHost(url: string | null | undefined): string {
+  try {
+    return new URL(url ?? '').hostname.replace(/^www\./, '').toLowerCase();
+  } catch {
+    return '';
+  }
+}
+
+function hostMatches(host: string, root: string): boolean {
+  return host === root || host.endsWith(`.${root}`);
+}
+
+/** True when the apply link stays on a job board instead of the employer. */
+export function isAggregatorApplyUrl(url: string | null | undefined): boolean {
+  const host = applyHost(url);
+  if (!host) return false;
+  if (
+    host === 'arbeitnow.com' ||
+    host.endsWith('.arbeitnow.com') ||
+    host.startsWith('arbeitnow.')
+  ) {
+    return true;
+  }
+  return AGGREGATOR_APPLY_HOSTS.some((root) => hostMatches(host, root));
+}
+
 export function deriveBadges(job: {
   id: string;
   title: string;
   salary: string | null;
   created_at: string | null;
+  apply_url?: string | null;
 }): JobBadge[] {
-  const badges: JobBadge[] = ['DIRECT_APPLY'];
+  const badges: JobBadge[] = [
+    isAggregatorApplyUrl(job.apply_url) ? 'CURATED_LINK' : 'DIRECT_APPLY',
+  ];
   const h = hashCode(job.id || job.title);
   const ageMins = minutesSince(job.created_at);
   if (job.salary) badges.push('SALARY_VERIFIED');

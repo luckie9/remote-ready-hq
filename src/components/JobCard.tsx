@@ -13,6 +13,7 @@ import {
   formatRelativeTime,
   formatSalaryHighlight,
   freshnessBadge,
+  isAggregatorApplyUrl,
   lockedDomainPreview,
   obfuscateListing,
   socialProofLine,
@@ -24,6 +25,7 @@ const BADGE_STYLES: Record<JobBadge, string> = {
   HOT: 'bg-[#DC2626] text-white border-transparent',
   FEATURED: 'bg-[#D97706] text-white border-transparent',
   DIRECT_APPLY: 'bg-[#059669] text-white border-transparent',
+  CURATED_LINK: 'border border-slate-600/80 bg-slate-800/80 text-slate-400',
   SALARY_VERIFIED: 'bg-[#0284C7] text-white border-transparent',
 };
 
@@ -31,6 +33,7 @@ const BADGE_LABELS: Record<JobBadge, string> = {
   HOT: 'HOT',
   FEATURED: 'FEATURED',
   DIRECT_APPLY: 'DIRECT APPLY',
+  CURATED_LINK: 'Curated Link',
   SALARY_VERIFIED: 'SALARY VERIFIED',
 };
 
@@ -67,6 +70,7 @@ export function JobCard({
 
   const jobCategory = categorizeJob(job.title, job.description);
   const badges = job.badges ?? deriveBadges(job);
+  const curated = isAggregatorApplyUrl(job.apply_url);
   const domain = job.locked_domain ?? lockedDomainPreview(job.apply_url);
   const proof = job.social_proof ?? socialProofLine(job.id, badges);
   const fresh = freshnessBadge(job.created_at);
@@ -130,7 +134,9 @@ export function JobCard({
             {badges.map((badge) => (
               <span
                 key={badge}
-                className={`rounded px-1.5 py-0.5 text-[10px] font-bold tracking-wide ${BADGE_STYLES[badge]}`}
+                className={`rounded px-1.5 py-0.5 text-[10px] tracking-wide ${
+                  badge === 'CURATED_LINK' ? 'font-medium' : 'font-bold'
+                } ${BADGE_STYLES[badge]}`}
               >
                 {BADGE_LABELS[badge]}
               </span>
@@ -200,7 +206,11 @@ export function JobCard({
                 type="button"
                 onClick={onLockedClick}
                 className="select-none rounded border border-slate-700 bg-slate-950/60 px-2 py-1 font-mono text-[11px] text-slate-400 [filter:blur(2.5px)] transition hover:border-emerald-500/40"
-                aria-label="Unlock direct application link"
+                aria-label={
+                  curated
+                    ? 'Unlock curated application link'
+                    : 'Unlock direct application link'
+                }
               >
                 {domain}
               </button>
@@ -216,7 +226,9 @@ export function JobCard({
             jobId={job.id}
             isSubscriber={isSubscriber}
             applyUrl={job.apply_url}
-            unlockLabel="Unlock Direct Link ($1.97)"
+            unlockLabel={
+              curated ? 'Unlock Listing ($1.97)' : 'Unlock Direct Link ($1.97)'
+            }
           />
         </div>
       </div>
@@ -242,17 +254,27 @@ export function JobCard({
                         type="button"
                         onClick={onLockedClick}
                         className="select-none rounded border border-slate-700 bg-slate-950 px-2 py-0.5 font-mono text-[11px] [filter:blur(2.5px)] transition hover:border-emerald-500/40"
-                        aria-label="Unlock direct application link"
+                        aria-label={
+                          curated
+                            ? 'Unlock curated application link'
+                            : 'Unlock direct application link'
+                        }
                       >
                         {domain}
                       </button>
                       <span className="font-semibold text-slate-200">
-                        🔒 Direct link locked
+                        {curated ? '🔒 Link locked' : '🔒 Direct link locked'}
                       </span>
                     </p>
                   ) : (
-                    <p className="mt-0.5 truncate text-xs text-emerald-400">
-                      Direct recruiter link unlocked
+                    <p
+                      className={`mt-0.5 truncate text-xs ${
+                        curated ? 'text-slate-400' : 'text-emerald-400'
+                      }`}
+                    >
+                      {curated
+                        ? 'Curated board link unlocked'
+                        : 'Direct recruiter link unlocked'}
                     </p>
                   )}
                 </div>
@@ -261,7 +283,11 @@ export function JobCard({
                   isSubscriber={isSubscriber}
                   applyUrl={job.apply_url}
                   applyLabel="Apply Now"
-                  unlockLabel="Unlock Direct Application ($1.97)"
+                  unlockLabel={
+                    curated
+                      ? 'Unlock Listing ($1.97)'
+                      : 'Unlock Direct Application ($1.97)'
+                  }
                   className={
                     isSubscriber
                       ? 'inline-flex w-full cursor-pointer items-center justify-center rounded-full bg-emerald-600 px-5 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-emerald-500 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-300 active:scale-[0.98] sm:w-auto'
