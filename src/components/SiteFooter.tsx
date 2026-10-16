@@ -4,6 +4,7 @@ import Link from 'next/link';
 import { CancelSubscriptionLink } from '@/components/CancelSubscriptionLink';
 import { JobAlertForm } from '@/components/JobAlertForm';
 import { useAuth } from '@/components/AuthProvider';
+import { SEO_ROLES, seoRolePath } from '@/lib/seo-landings';
 
 export function SiteFooter() {
   const { hideJobAlerts, hasSubscribedAlerts, jobAlertsReady } = useAuth();
@@ -25,7 +26,22 @@ export function SiteFooter() {
           </div>
         )}
 
-        <div className="mt-10 flex flex-col items-center justify-between gap-4 text-sm text-slate-500 sm:flex-row">
+        <nav
+          aria-label="Remote job categories"
+          className="mt-10 flex flex-wrap items-center justify-center gap-x-4 gap-y-2 text-sm text-slate-500"
+        >
+          {SEO_ROLES.map((role) => (
+            <Link
+              key={role.slug}
+              href={seoRolePath(role)}
+              className="transition hover:text-white"
+            >
+              Remote {role.label}
+            </Link>
+          ))}
+        </nav>
+
+        <div className="mt-8 flex flex-col items-center justify-between gap-4 text-sm text-slate-500 sm:flex-row">
           <p className="font-medium text-slate-300">RemoteReady HQ</p>
           <nav className="flex flex-wrap items-center justify-center gap-5">
             <Link href="/" className="transition hover:text-white">

@@ -8,6 +8,7 @@ import { JobAlertFloatButton } from '@/components/JobAlertFloatButton';
 import { JobAlertModal } from '@/components/JobAlertModal';
 import { UnlockModal } from '@/components/UnlockModal';
 import { UnlockProvider } from '@/components/UnlockProvider';
+import { siteUrl } from '@/lib/seo-landings';
 import './globals.css';
 
 const sans = Plus_Jakarta_Sans({
@@ -23,6 +24,7 @@ const mono = JetBrains_Mono({
 });
 
 export const metadata: Metadata = {
+  metadataBase: new URL(siteUrl()),
   title: 'RemoteReady HQ',
   description:
     'Hand-picked, active remote roles from top global companies. Updated daily.',

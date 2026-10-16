@@ -2,18 +2,9 @@ import { BrandMark } from '@/components/BrandMark';
 import { JobBoard } from '@/components/JobBoard';
 import { SiteFooter } from '@/components/SiteFooter';
 import { SiteHeader } from '@/components/SiteHeader';
-import { createAdminSupabase, supabase } from '@/lib/supabase';
+import { minutesSince } from '@/lib/jobs';
+import { loadLiveJobs } from '@/lib/load-jobs';
 import { getEffectiveSubscriberSession } from '@/lib/subscription';
-import {
-  applicantsToday,
-  deriveBadges,
-  formatRelativeTime,
-  isLiveScrapedApplyUrl,
-  lockedDomainPreview,
-  minutesSince,
-  socialProofLine,
-  type Job,
-} from '@/lib/jobs';
 
 export const revalidate = 0;
 
@@ -27,51 +18,7 @@ export default async function Home() {
   const subscriber = await getEffectiveSubscriberSession();
   const isSubscriber = Boolean(subscriber);
 
-  let jobs: Job[] = [];
-  let errorMessage: string | null = null;
-
-  try {
-    const client = (() => {
-      try {
-        return createAdminSupabase();
-      } catch {
-        return supabase;
-      }
-    })();
-
-    const { data, error } = await client
-      .from('jobs')
-      .select(
-        'id, title, company, location, salary, apply_url, created_at, description'
-      )
-      .order('created_at', { ascending: false });
-
-    if (error) {
-      errorMessage = error.message;
-    } else {
-      jobs = ((data ?? []) as Job[])
-        .filter(
-          (job) =>
-            isLiveScrapedApplyUrl(job.apply_url) &&
-            Boolean(job.title?.trim()) &&
-            Boolean(job.company?.trim())
-        )
-        .map((job) => {
-          const badges = deriveBadges(job);
-          return {
-            ...job,
-            posted_label: formatRelativeTime(job.created_at),
-            badges,
-            locked_domain: lockedDomainPreview(job.apply_url),
-            applicants_today: applicantsToday(job.id),
-            social_proof: socialProofLine(job.id, badges),
-          };
-        });
-    }
-  } catch (err) {
-    errorMessage =
-      err instanceof Error ? err.message : 'Unknown database connection error';
-  }
+  const { jobs, errorMessage } = await loadLiveJobs();
 
   const freshest = jobs[0]?.created_at ?? null;
   const updatedMins = minutesSince(freshest);

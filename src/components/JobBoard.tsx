@@ -25,9 +25,11 @@ const INPUT_CLASS =
 export function JobBoard({
   jobs,
   isSubscriber,
+  hideCategories = false,
 }: {
   jobs: Job[];
   isSubscriber: boolean;
+  hideCategories?: boolean;
 }) {
   const [query, setQuery] = useState('');
   const [locationQuery, setLocationQuery] = useState('');
@@ -172,6 +174,7 @@ export function JobBoard({
           </label>
         </div>
 
+        {hideCategories ? null : (
         <div
           className="flex flex-wrap justify-center gap-2"
           role="tablist"
@@ -199,6 +202,7 @@ export function JobBoard({
             );
           })}
         </div>
+        )}
       </div>
 
       <div>
