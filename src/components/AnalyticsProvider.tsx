@@ -11,8 +11,20 @@ const apiKey = process.env.NEXT_PUBLIC_POSTHOG_KEY;
 const apiHost =
   process.env.NEXT_PUBLIC_POSTHOG_HOST || 'https://us.i.posthog.com';
 
+let reportedInit = false;
+
+function reportPostHog(message: string, details?: Record<string, string>) {
+  if (reportedInit) return;
+  reportedInit = true;
+  console.log(`[PostHog] ${message}`, details ?? '');
+}
+
 function ensurePostHog() {
-  if (typeof window === 'undefined' || !apiKey) return false;
+  if (typeof window === 'undefined') return false;
+  if (!apiKey) {
+    reportPostHog('not initialized: NEXT_PUBLIC_POSTHOG_KEY is unset');
+    return false;
+  }
   if (!posthog.__loaded) {
     posthog.init(apiKey, {
       api_host: apiHost,
@@ -20,6 +32,17 @@ function ensurePostHog() {
       capture_pageview: false,
       capture_pageleave: true,
       persistence: 'localStorage+cookie',
+      loaded: (client) => {
+        reportPostHog('initialized', {
+          host: apiHost,
+          distinctId: client.get_distinct_id(),
+        });
+      },
+    });
+  } else {
+    reportPostHog('initialized', {
+      host: apiHost,
+      distinctId: posthog.get_distinct_id(),
     });
   }
   if (process.env.NODE_ENV === 'development') {
@@ -29,15 +52,17 @@ function ensurePostHog() {
   return posthog.__loaded;
 }
 
-function PageViewTracker() {
+function PostHogPageView() {
   const pathname = usePathname();
   const searchParams = useSearchParams();
 
   useEffect(() => {
-    ensurePostHog();
-    const search = searchParams?.toString();
+    if (!ensurePostHog() || !pathname) return;
+    const search = searchParams?.toString() ?? '';
     const path = search ? `${pathname}?${search}` : pathname;
-    track('page_viewed', { path: path || '/', pathname: pathname || '/' });
+    const url = `${window.location.origin}${path}`;
+    posthog.capture('$pageview', { $current_url: url });
+    track('page_viewed', { path, pathname });
   }, [pathname, searchParams]);
 
   return null;
@@ -51,7 +76,7 @@ export function AnalyticsProvider({ children }: { children: ReactNode }) {
   const body = (
     <>
       <Suspense fallback={null}>
-        <PageViewTracker />
+        <PostHogPageView />
       </Suspense>
       {children}
       <Analytics />
